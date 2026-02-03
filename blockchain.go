@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"time"
 
@@ -38,12 +39,15 @@ func CreateBlockchain() *Blockchain {
 
 func (bc *Blockchain) MineBlock(txs []Transaction) error {
 	for _, tx := range txs {
-		if tx.From == "" { // 挖矿奖励
+		if !tx.Verify() {
+			return fmt.Errorf("发现非法签名交易")
+		}
+		/*if len(tx.From) == 0 { // 挖矿奖励
 			continue
 		}
 		if bc.GetBalance(tx.From) < tx.Amount {
 			return fmt.Errorf("交易非法，余额不足: %s", tx.From)
-		}
+		}*/
 	}
 
 	var lastHash []byte
@@ -76,10 +80,17 @@ func NewBlock(txs []Transaction, prevHash []byte) *Block {
 }
 
 func NewGenesisBlock() *Block {
-	return NewBlock([]Transaction{{"", "genesis", 100}}, []byte{})
+	genesisTx := Transaction{
+		From:      nil,
+		To:        []byte("genesis"), // 只是占位标识
+		Amount:    100,
+		Signature: nil,
+		PubKey:    nil,
+	}
+	return NewBlock([]Transaction{genesisTx}, []byte{})
 }
 
-func (bc *Blockchain) GetBalance(address string) int {
+func (bc *Blockchain) GetBalance(address []byte) int {
 	balance := 0
 
 	bc.DB.View(func(tx *bolt.Tx) error {
@@ -90,10 +101,10 @@ func (bc *Blockchain) GetBalance(address string) int {
 			block := DeserializeBlock(v)
 
 			for _, tx := range block.Transactions {
-				if tx.To == address {
+				if tx.To != nil && bytes.Equal(tx.To, address) {
 					balance += tx.Amount
 				}
-				if tx.From == address {
+				if tx.From != nil && bytes.Equal(tx.From, address) {
 					balance -= tx.Amount
 				}
 			}

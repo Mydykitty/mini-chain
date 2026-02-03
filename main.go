@@ -6,21 +6,19 @@ func main() {
 	bc := CreateBlockchain()
 	defer bc.DB.Close()
 
-	fmt.Println("Alice 余额:", bc.GetBalance("Alice"))
-	fmt.Println("Bob 余额:", bc.GetBalance("Bob"))
+	alice := NewWallet()
+	bob := NewWallet()
 
-	tx1 := Transaction{"Alice", "Bob", 50}
-	tx2 := Transaction{"Bob", "Charlie", 20}
+	fmt.Printf("Alice地址: %x\n", alice.GetAddress())
+	fmt.Printf("Bob地址: %x\n", bob.GetAddress())
 
-	err := bc.MineBlock([]Transaction{tx1, tx2})
+	tx := NewTransaction(alice, bob.GetAddress(), 10)
+
+	err := bc.MineBlock([]Transaction{*tx})
 	if err != nil {
-		fmt.Println("❌ 挖矿失败:", err)
+		fmt.Println("挖矿失败:", err)
 		return
 	}
-	fmt.Println("✅ 区块挖矿成功")
 
-	fmt.Println("挖矿后余额：")
-	fmt.Println("Alice:", bc.GetBalance("Alice"))
-	fmt.Println("Bob:", bc.GetBalance("Bob"))
-	fmt.Println("Charlie:", bc.GetBalance("Charlie"))
+	fmt.Println("挖矿成功")
 }
