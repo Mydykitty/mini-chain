@@ -43,3 +43,11 @@ func sendData(addr string, data []byte) {
 	defer conn.Close()
 	conn.Write(data)
 }
+
+func SendTx(addr string, tnx *Transaction) {
+	data := tx{nodeAddress, tnx.Serialize()}
+	payload := gobEncode(data)
+	request := append(commandToBytes("tx"), payload...)
+
+	sendData(addr, request)
+}

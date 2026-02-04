@@ -14,6 +14,7 @@ var nodeAddress string
 var knownNodes = []string{"localhost:3000"} // 种子节点
 var blocksInTransit = [][]byte{}
 var mempool = make(map[string]Transaction)
+var miningInterrupt = make(chan bool)
 
 func StartServer(nodeID string, bc *Blockchain) {
 	nodeAddress = fmt.Sprintf("localhost:%s", nodeID)
@@ -57,6 +58,8 @@ func handleConnection(conn net.Conn, bc *Blockchain) {
 		handleGetData(request, bc)
 	case "block":
 		handleBlock(request, bc)
+	case "tx":
+		handleTx(request, bc)
 	default:
 		fmt.Println("未知命令")
 	}

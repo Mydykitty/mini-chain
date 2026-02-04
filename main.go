@@ -1,7 +1,11 @@
 package main
 
 import (
+	"encoding/hex"
+	"fmt"
 	"os"
+	"strconv"
+	"time"
 )
 
 func main() {
@@ -15,11 +19,54 @@ func main() {
 		case "getchain":
 			PrintChain(nodeID)
 			return
+		case "send":
+			from := os.Args[3]
+			to := os.Args[4]
+			amount, _ := strconv.Atoi(os.Args[5])
+			Send(from, to, amount, nodeID)
+			return
 		}
 	}
 
 	address := "miner"
 	bc := CreateBlockchain(address, nodeID)
+	go func() {
+		fmt.Println("🟢 自动挖矿线程已启动")
+
+		for {
+			time.Sleep(10 * time.Second)
+
+			if len(mempool) == 0 {
+				continue
+			}
+
+			var txs []*Transaction
+
+			for _, tx := range mempool {
+				txs = append(txs, &tx)
+			}
+
+			cbTx := NewCoinbaseTX("miner-"+nodeID, "") // todo 需要加nodeID么
+			txs = append(txs, cbTx)
+
+			newBlock := bc.MineBlock(txs)
+
+			fmt.Println("⛏️ 打包交易挖出新区块，高度:", newBlock.Height)
+
+			// 清空已打包交易
+			for _, tx := range txs {
+				txID := hex.EncodeToString(tx.ID)
+				delete(mempool, txID)
+			}
+
+			for _, node := range knownNodes {
+				if node != nodeAddress {
+					SendInv(node, "block", [][]byte{newBlock.Hash})
+				}
+			}
+		}
+	}()
+
 	/*go func() {
 		for {
 			time.Sleep(20 * time.Second)

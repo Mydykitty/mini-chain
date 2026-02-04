@@ -45,6 +45,13 @@ func (pow *ProofOfWork) Run() (int, []byte) {
 	fmt.Println("⛏️  开始挖矿...")
 
 	for {
+		select {
+		case <-miningInterrupt:
+			fmt.Println("🛑 挖矿被中断，发现新区块")
+			return 0, []byte{}
+		default:
+		}
+
 		data := pow.prepareData(nonce)
 		hash = sha256.Sum256(data)
 		hashInt.SetBytes(hash[:])

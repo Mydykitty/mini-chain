@@ -22,3 +22,8 @@ type BlockData struct {
 	AddrFrom string
 	Block    []byte
 }
+
+type tx struct {
+	AddrFrom    string
+	Transaction []byte
+}

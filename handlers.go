@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"encoding/gob"
+	"encoding/hex"
 	"fmt"
+	"log"
 )
 
 func decodePayload(data []byte, v interface{}) {
@@ -71,6 +73,9 @@ func handleGetData(request []byte, bc *Blockchain) {
 }
 
 func handleBlock(request []byte, bc *Blockchain) {
+	fmt.Println("📦 收到新区块，通知停止挖矿")
+	miningInterrupt <- true
+
 	var payload BlockData
 	decodePayload(request[12:], &payload)
 
@@ -80,4 +85,29 @@ func handleBlock(request []byte, bc *Blockchain) {
 	bc.AddBlockFromNetwork(block)
 
 	fmt.Printf("当前区块高度: %d\n", getBestHeight(bc))
+}
+
+func handleTx(request []byte, bc *Blockchain) {
+	var payload tx
+
+	buff := bytes.NewBuffer(request[12:])
+	dec := gob.NewDecoder(buff)
+	err := dec.Decode(&payload)
+	if err != nil {
+		log.Panic(err)
+	}
+
+	txData := payload.Transaction
+	transaction := DeserializeTransaction(txData)
+
+	mempool[hex.EncodeToString(transaction.ID)] = transaction
+
+	fmt.Println("📥 收到新交易，已加入交易池")
+
+	// 继续向其他节点广播
+	for _, node := range knownNodes {
+		if node != nodeAddress && node != payload.AddrFrom {
+			SendTx(node, &transaction)
+		}
+	}
 }
