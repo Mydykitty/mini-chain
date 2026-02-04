@@ -3,22 +3,40 @@ package main
 import "fmt"
 
 func main() {
-	bc := CreateBlockchain()
-	defer bc.DB.Close()
+	// 创建钱包
+	aliceWallet := NewWallet()
+	bobWallet := NewWallet()
 
-	alice := NewWallet()
-	bob := NewWallet()
+	aliceAddr := string(aliceWallet.PublicKey)
+	bobAddr := string(bobWallet.PublicKey)
 
-	fmt.Printf("Alice地址: %x\n", alice.GetAddress())
-	fmt.Printf("Bob地址: %x\n", bob.GetAddress())
+	// 创建区块链
+	bc := CreateBlockchain(aliceAddr)
 
-	tx := NewTransaction(alice, bob.GetAddress(), 10)
+	// 创世块余额
+	fmt.Println("Alice创世块余额:", 100)
 
-	err := bc.MineBlock([]Transaction{*tx})
-	if err != nil {
-		fmt.Println("挖矿失败:", err)
-		return
+	// Alice转账给Bob 30
+	tx := NewUTXOTransaction(aliceAddr, bobAddr, 30, bc)
+	bc.AddBlock([]*Transaction{tx})
+
+	fmt.Println("Alice -> Bob 30 转账完成")
+
+	// 遍历区块链打印
+	bci := bc.Iterator()
+	for {
+		block := bci.Next()
+		fmt.Printf("\n=== 区块 ===\nHash: %x\nPrevHash: %x\n", block.Hash, block.PrevHash)
+		for i, tx := range block.Transactions {
+			fmt.Printf("  交易 %d\n", i)
+			for j, out := range tx.Vout {
+				fmt.Printf("    输出 %d 金额: %d\n", j, out.Value)
+			}
+		}
+		if len(block.PrevHash) == 0 {
+			break
+		}
 	}
 
-	fmt.Println("挖矿成功")
+	bc.PrintBlockchain()
 }

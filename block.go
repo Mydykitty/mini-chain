@@ -2,35 +2,62 @@ package main
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"encoding/gob"
+	"log"
+	"time"
 )
 
 type Block struct {
 	Timestamp    int64
-	Transactions []Transaction
+	Transactions []*Transaction
 	PrevHash     []byte
 	Hash         []byte
 	Nonce        int
 }
 
-func (b *Block) Serialize() []byte {
-	var res bytes.Buffer
-	gob.NewEncoder(&res).Encode(b)
-	return res.Bytes()
+// 创建新区块
+func NewBlock(txs []*Transaction, prevHash []byte) *Block {
+	block := &Block{time.Now().Unix(), txs, prevHash, []byte{}, 0}
+	hash := block.HashBlock()
+	block.Hash = hash
+	return block
 }
 
-func DeserializeBlock(data []byte) *Block {
+// 创世块
+func NewGenesisBlock(coinbase *Transaction) *Block {
+	return NewBlock([]*Transaction{coinbase}, []byte{})
+}
+
+// 序列化
+func (b *Block) Serialize() []byte {
+	var result bytes.Buffer
+	encoder := gob.NewEncoder(&result)
+	err := encoder.Encode(b)
+	if err != nil {
+		log.Panic(err)
+	}
+	return result.Bytes()
+}
+
+// 反序列化
+func DeserializeBlock(d []byte) *Block {
 	var block Block
-	gob.NewDecoder(bytes.NewReader(data)).Decode(&block)
+	decoder := gob.NewDecoder(bytes.NewReader(d))
+	err := decoder.Decode(&block)
+	if err != nil {
+		log.Panic(err)
+	}
 	return &block
 }
 
-func (b *Block) HashTransactions() []byte {
-	var txHashes [][]byte
-	for _, tx := range b.Transactions {
-		txHashes = append(txHashes, tx.Serialize())
+// 简单 hash 作为演示
+func (b *Block) HashBlock() []byte {
+	var encoded bytes.Buffer
+	enc := gob.NewEncoder(&encoded)
+	err := enc.Encode(b)
+	if err != nil {
+		log.Panic(err)
 	}
-	hash := sha256.Sum256(bytes.Join(txHashes, []byte{}))
-	return hash[:]
+	hash := Sha256(encoded.Bytes())
+	return hash
 }

@@ -2,13 +2,13 @@ package main
 
 import (
 	"bytes"
+	"encoding/hex"
 	"fmt"
-	"time"
+	"log"
 
-	"github.com/boltdb/bolt"
+	bolt "go.etcd.io/bbolt"
 )
 
-const dbFile = "blockchain.db"
 const blocksBucket = "blocks"
 
 type Blockchain struct {
@@ -16,14 +16,20 @@ type Blockchain struct {
 	DB  *bolt.DB
 }
 
-func CreateBlockchain() *Blockchain {
-	db, _ := bolt.Open(dbFile, 0600, nil)
+// 创建区块链
+func CreateBlockchain(address string) *Blockchain {
+	db, err := bolt.Open("blockchain.db", 0600, nil)
+	if err != nil {
+		log.Panic(err)
+	}
 
 	var tip []byte
-	db.Update(func(tx *bolt.Tx) error {
+
+	err = db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(blocksBucket))
+
 		if b == nil {
-			genesis := NewGenesisBlock()
+			genesis := NewGenesisBlock(NewCoinbaseTX(address, "Genesis Block"))
 			b, _ = tx.CreateBucket([]byte(blocksBucket))
 			b.Put(genesis.Hash, genesis.Serialize())
 			b.Put([]byte("l"), genesis.Hash)
@@ -33,84 +39,167 @@ func CreateBlockchain() *Blockchain {
 		}
 		return nil
 	})
+	if err != nil {
+		log.Panic(err)
+	}
 
 	return &Blockchain{tip, db}
 }
 
-func (bc *Blockchain) MineBlock(txs []Transaction) error {
-	for _, tx := range txs {
-		if !tx.Verify() {
-			return fmt.Errorf("发现非法签名交易")
-		}
-		/*if len(tx.From) == 0 { // 挖矿奖励
-			continue
-		}
-		if bc.GetBalance(tx.From) < tx.Amount {
-			return fmt.Errorf("交易非法，余额不足: %s", tx.From)
-		}*/
-	}
-
+// 添加新区块
+func (bc *Blockchain) AddBlock(transactions []*Transaction) {
 	var lastHash []byte
-	bc.DB.View(func(tx *bolt.Tx) error {
+
+	err := bc.DB.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(blocksBucket))
 		lastHash = b.Get([]byte("l"))
 		return nil
 	})
+	if err != nil {
+		log.Panic(err)
+	}
 
-	block := NewBlock(txs, lastHash)
+	newBlock := NewBlock(transactions, lastHash)
 
-	bc.DB.Update(func(tx *bolt.Tx) error {
+	err = bc.DB.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(blocksBucket))
-		b.Put(block.Hash, block.Serialize())
-		b.Put([]byte("l"), block.Hash)
-		bc.Tip = block.Hash
+		b.Put(newBlock.Hash, newBlock.Serialize())
+		b.Put([]byte("l"), newBlock.Hash)
+		bc.Tip = newBlock.Hash
 		return nil
 	})
-
-	return nil
 }
 
-func NewBlock(txs []Transaction, prevHash []byte) *Block {
-	block := &Block{time.Now().Unix(), txs, prevHash, []byte{}, 0}
-	pow := NewProofOfWork(block)
-	nonce, hash := pow.Run()
-	block.Hash = hash
-	block.Nonce = nonce
+// 区块链迭代器
+type BlockchainIterator struct {
+	CurrentHash []byte
+	DB          *bolt.DB
+}
+
+func (bc *Blockchain) Iterator() *BlockchainIterator {
+	return &BlockchainIterator{bc.Tip, bc.DB}
+}
+
+func (i *BlockchainIterator) Next() *Block {
+	var block *Block
+	err := i.DB.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(blocksBucket))
+		encodedBlock := b.Get(i.CurrentHash)
+		block = DeserializeBlock(encodedBlock)
+		return nil
+	})
+	if err != nil {
+		log.Panic(err)
+	}
+	i.CurrentHash = block.PrevHash
 	return block
 }
 
-func NewGenesisBlock() *Block {
-	genesisTx := Transaction{
-		From:      nil,
-		To:        []byte("genesis"), // 只是占位标识
-		Amount:    100,
-		Signature: nil,
-		PubKey:    nil,
-	}
-	return NewBlock([]Transaction{genesisTx}, []byte{})
-}
+// 查找UTXO
+func (bc *Blockchain) FindSpendableOutputs(pubKeyHash []byte, amount int) (int, map[string][]int) {
+	unspentOuts := make(map[string][]int)
+	accumulated := 0
+	spentTXOs := make(map[string][]int)
+	bci := bc.Iterator()
 
-func (bc *Blockchain) GetBalance(address []byte) int {
-	balance := 0
+	for {
+		block := bci.Next()
 
-	bc.DB.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(blocksBucket))
-		c := b.Cursor()
-
-		for k, v := c.First(); k != nil; k, v = c.Next() {
-			block := DeserializeBlock(v)
-
-			for _, tx := range block.Transactions {
-				if tx.To != nil && bytes.Equal(tx.To, address) {
-					balance += tx.Amount
+		for _, tx := range block.Transactions {
+			txID := hex.EncodeToString(tx.ID)
+		Outputs:
+			for outIdx, out := range tx.Vout {
+				if spentTXOs[txID] != nil {
+					for _, spentOut := range spentTXOs[txID] {
+						if spentOut == outIdx {
+							continue Outputs
+						}
+					}
 				}
-				if tx.From != nil && bytes.Equal(tx.From, address) {
-					balance -= tx.Amount
+				if out.IsLockedWithKey(pubKeyHash) && accumulated < amount {
+					accumulated += out.Value
+					unspentOuts[txID] = append(unspentOuts[txID], outIdx)
+					if accumulated >= amount {
+						break
+					}
+				}
+			}
+
+			if !tx.IsCoinbase() {
+				for _, in := range tx.Vin {
+					if bytes.Equal(HashPubKey(in.PubKey), pubKeyHash) {
+						inTxID := hex.EncodeToString(in.Txid)
+						spentTXOs[inTxID] = append(spentTXOs[inTxID], in.OutIndex)
+					}
 				}
 			}
 		}
-		return nil
-	})
+		if len(block.PrevHash) == 0 {
+			break
+		}
+	}
 
-	return balance
+	return accumulated, unspentOuts
+}
+
+// 根据交易ID查找交易
+func (bc *Blockchain) FindTransaction(ID []byte) (Transaction, error) {
+	bci := bc.Iterator()
+
+	for {
+		block := bci.Next()
+
+		for _, tx := range block.Transactions {
+			if bytes.Equal(tx.ID, ID) {
+				return *tx, nil
+			}
+		}
+
+		if len(block.PrevHash) == 0 {
+			break
+		}
+	}
+
+	return Transaction{}, fmt.Errorf("交易 %x 未找到", ID)
+}
+
+func (bc *Blockchain) PrintBlockchain() {
+	bci := bc.Iterator()
+	fmt.Println("=== 开始遍历区块链 ===")
+
+	for {
+		block := bci.Next()
+		fmt.Printf("\n--- 区块 ---\n")
+		fmt.Printf("Hash: %x\n", block.Hash)
+		fmt.Printf("PrevHash: %x\n", block.PrevHash)
+		fmt.Printf("时间戳: %d\n", block.Timestamp)
+
+		for i, tx := range block.Transactions {
+			fmt.Printf("  交易 %d:\n", i)
+			fmt.Printf("    ID: %x\n", tx.ID)
+			if tx.IsCoinbase() {
+				fmt.Println("    Coinbase交易（挖矿奖励）")
+			}
+
+			for j, in := range tx.Vin {
+				fmt.Printf("    输入 %d:\n", j)
+				fmt.Printf("      TxID: %x\n", in.Txid)
+				fmt.Printf("      OutIndex: %d\n", in.OutIndex)
+				fmt.Printf("      PubKey: %x\n", in.PubKey)
+				fmt.Printf("      Signature: %x\n", in.Signature)
+			}
+
+			for j, out := range tx.Vout {
+				fmt.Printf("    输出 %d:\n", j)
+				fmt.Printf("      金额: %d\n", out.Value)
+				fmt.Printf("      公钥哈希: %x\n", out.PubKeyHash)
+			}
+		}
+
+		if len(block.PrevHash) == 0 {
+			break
+		}
+	}
+
+	fmt.Println("=== 遍历结束 ===")
 }

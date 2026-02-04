@@ -2,73 +2,69 @@ package main
 
 import (
 	"bytes"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/sha256"
 	"encoding/gob"
-	"math/big"
+	"log"
 )
 
 type Transaction struct {
-	From      []byte
-	To        []byte
-	Amount    int
+	ID   []byte
+	Vin  []TXInput
+	Vout []TXOutput
+}
+
+type TXInput struct {
+	Txid      []byte
+	OutIndex  int
 	Signature []byte
 	PubKey    []byte
 }
 
-func NewTransaction(w *Wallet, to []byte, amount int) *Transaction {
-	tx := &Transaction{
-		From:   w.GetAddress(),
-		To:     to,
-		Amount: amount,
-		PubKey: w.PublicKey,
+type TXOutput struct {
+	Value      int
+	PubKeyHash []byte
+}
+
+// Coinbase判断
+func (tx *Transaction) IsCoinbase() bool {
+	return len(tx.Vin) == 1 && len(tx.Vin[0].Txid) == 0 && tx.Vin[0].OutIndex == -1
+}
+
+// 设置ID
+func (tx *Transaction) SetID() {
+	var encoded bytes.Buffer
+	enc := gob.NewEncoder(&encoded)
+	err := enc.Encode(tx)
+	if err != nil {
+		log.Panic(err)
 	}
-	tx.Sign(w.PrivateKey)
-	return tx
+	tx.ID = Sha256(encoded.Bytes())
 }
 
-func (tx *Transaction) Hash() []byte {
-	var hash [32]byte
-	txCopy := *tx
-	txCopy.Signature = nil
-	txCopy.PubKey = nil
-
-	var buf bytes.Buffer
-	gob.NewEncoder(&buf).Encode(txCopy)
-	hash = sha256.Sum256(buf.Bytes())
-	return hash[:]
+// 创建UTXO输出
+func NewTXOutput(value int, address string) *TXOutput {
+	txo := &TXOutput{value, nil}
+	txo.Lock([]byte(address))
+	return txo
 }
 
-func (tx *Transaction) Sign(priv ecdsa.PrivateKey) {
-	hash := tx.Hash()
-	r, s, _ := ecdsa.Sign(rand.Reader, &priv, hash)
-	signature := append(r.Bytes(), s.Bytes()...)
-	tx.Signature = signature
+// 输出锁定到某个地址
+func (out *TXOutput) Lock(address []byte) {
+	out.PubKeyHash = HashPubKey(address)
 }
 
-func (tx *Transaction) Verify() bool {
-	hash := tx.Hash()
-
-	r := big.Int{}
-	s := big.Int{}
-	sigLen := len(tx.Signature)
-	r.SetBytes(tx.Signature[:sigLen/2])
-	s.SetBytes(tx.Signature[sigLen/2:])
-
-	x := big.Int{}
-	y := big.Int{}
-	keyLen := len(tx.PubKey)
-	x.SetBytes(tx.PubKey[:keyLen/2])
-	y.SetBytes(tx.PubKey[keyLen/2:])
-
-	pubKey := ecdsa.PublicKey{Curve: elliptic.P256(), X: &x, Y: &y}
-	return ecdsa.Verify(&pubKey, hash, &r, &s)
+// 判断是否属于某人
+func (out *TXOutput) IsLockedWithKey(pubKeyHash []byte) bool {
+	return bytes.Equal(out.PubKeyHash, pubKeyHash)
 }
 
-func (tx *Transaction) Serialize() []byte {
-	var buf bytes.Buffer
-	gob.NewEncoder(&buf).Encode(tx)
-	return buf.Bytes()
+// Coinbase交易
+func NewCoinbaseTX(to, data string) *Transaction {
+	if data == "" {
+		data = "Block reward"
+	}
+	txin := TXInput{[]byte{}, -1, nil, []byte(data)}
+	txout := NewTXOutput(100, to)
+	tx := Transaction{nil, []TXInput{txin}, []TXOutput{*txout}}
+	tx.SetID()
+	return &tx
 }

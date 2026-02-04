@@ -4,8 +4,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/sha256"
-	"golang.org/x/crypto/ripemd160"
+	"log"
 )
 
 type Wallet struct {
@@ -14,19 +13,16 @@ type Wallet struct {
 }
 
 func NewWallet() *Wallet {
-	priv, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	priv, pub := newKeyPair()
+	return &Wallet{priv, pub}
+}
+
+func newKeyPair() (ecdsa.PrivateKey, []byte) {
+	curve := elliptic.P256()
+	priv, err := ecdsa.GenerateKey(curve, rand.Reader)
+	if err != nil {
+		log.Panic(err)
+	}
 	pub := append(priv.PublicKey.X.Bytes(), priv.PublicKey.Y.Bytes()...)
-	return &Wallet{*priv, pub}
-}
-
-func HashPubKey(pubKey []byte) []byte {
-	publicSHA256 := sha256.Sum256(pubKey)
-	ripemd := ripemd160.New()
-	ripemd.Write(publicSHA256[:])
-	return ripemd.Sum(nil)
-}
-
-func (w *Wallet) GetAddress() []byte {
-	pubHash := HashPubKey(w.PublicKey)
-	return pubHash
+	return *priv, pub
 }

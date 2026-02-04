@@ -6,6 +6,7 @@ toolchain go1.24.11
 
 require (
 	github.com/boltdb/bolt v1.3.1
+	go.etcd.io/bbolt v1.4.3
 	golang.org/x/crypto v0.47.0
 )
 
