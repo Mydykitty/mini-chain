@@ -1,0 +1,1262 @@
+===== block.go =====
+package main
+
+import (
+	"bytes"
+	"encoding/gob"
+	"log"
+)
+
+type Block struct {
+	Timestamp    int64
+	Transactions []*Transaction
+	PrevHash     []byte
+	Hash         []byte
+	Nonce        int
+	Height       int // 👈 新增：区块高度
+}
+
+// 创建新区块
+func NewBlock(txs []*Transaction, prevHash []byte, timeUnix int64, height int) *Block {
+	block := &Block{
+		Timestamp:    timeUnix,
+		Transactions: txs,
+		PrevHash:     prevHash,
+		Hash:         []byte{},
+		Nonce:        0,
+		Height:       height,
+	}
+
+	pow := NewProofOfWork(block)
+	nonce, hash := pow.Run()
+
+	block.Hash = hash[:]
+	block.Nonce = nonce
+
+	return block
+}
+
+// 创世块
+func NewGenesisBlock(coinbase *Transaction) *Block {
+	return NewBlock([]*Transaction{coinbase}, []byte{}, 1700000000, 1)
+}
+
+// 序列化
+func (b *Block) Serialize() []byte {
+	var result bytes.Buffer
+	encoder := gob.NewEncoder(&result)
+	err := encoder.Encode(b)
+	if err != nil {
+		log.Panic(err)
+	}
+	return result.Bytes()
+}
+
+// 反序列化
+func DeserializeBlock(d []byte) *Block {
+	var block Block
+	decoder := gob.NewDecoder(bytes.NewReader(d))
+	err := decoder.Decode(&block)
+	if err != nil {
+		log.Panic(err)
+	}
+	return &block
+}
+
+
+===== blockchain.go =====
+package main
+
+import (
+	"bytes"
+	"encoding/hex"
+	"fmt"
+	"log"
+	"os"
+	"time"
+
+	bolt "go.etcd.io/bbolt"
+)
+
+const blocksBucket = "blocks"
+const dbFile = "blockchain_%s.db"
+
+type Blockchain struct {
+	Tip []byte
+	DB  *bolt.DB
+}
+
+func CreateBlockchain(address, nodeID string) *Blockchain {
+	dbFileStr := fmt.Sprintf(dbFile, nodeID)
+
+	db, err := bolt.Open(dbFileStr, 0600, nil)
+	if err != nil {
+		log.Panic(err)
+	}
+
+	var tip []byte
+
+	err = db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(blocksBucket))
+
+		if b == nil {
+			genesis := NewGenesisBlock(NewCoinbaseTX(address, "Genesis Block"))
+			b, _ = tx.CreateBucket([]byte(blocksBucket))
+			b.Put(genesis.Hash, genesis.Serialize())
+			b.Put([]byte("l"), genesis.Hash)
+			tip = genesis.Hash
+		} else {
+			tip = b.Get([]byte("l"))
+		}
+		return nil
+	})
+	if err != nil {
+		log.Panic(err)
+	}
+
+	return &Blockchain{tip, db}
+}
+
+func NewBlockchain(nodeID string) *Blockchain {
+	dbFileStr := fmt.Sprintf(dbFile, nodeID)
+
+	if _, err := os.Stat(dbFileStr); os.IsNotExist(err) {
+		fmt.Println("❌ 区块链不存在，请先创建创世区块")
+		os.Exit(1)
+	}
+
+	var tip []byte
+	db, err := bolt.Open(dbFileStr, 0600, nil)
+	if err != nil {
+		log.Panic(err)
+	}
+
+	err = db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(blocksBucket))
+		tip = b.Get([]byte("l"))
+		return nil
+	})
+	if err != nil {
+		log.Panic(err)
+	}
+
+	bc := Blockchain{tip, db}
+	return &bc
+}
+
+// 添加新区块
+func (bc *Blockchain) AddBlock(transactions []*Transaction) {
+	var lastHash []byte
+	var lastHeight int
+
+	err := bc.DB.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(blocksBucket))
+		lastHash = b.Get([]byte("l"))
+		blockData := b.Get(lastHash)
+		block := DeserializeBlock(blockData)
+		lastHeight = block.Height
+		return nil
+	})
+	if err != nil {
+		log.Panic(err)
+	}
+
+	newBlock := NewBlock(transactions, lastHash, time.Now().Unix(), lastHeight+1)
+
+	err = bc.DB.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(blocksBucket))
+		b.Put(newBlock.Hash, newBlock.Serialize())
+		b.Put([]byte("l"), newBlock.Hash)
+		bc.Tip = newBlock.Hash
+		return nil
+	})
+}
+
+// 区块链迭代器
+type BlockchainIterator struct {
+	CurrentHash []byte
+	DB          *bolt.DB
+}
+
+func (bc *Blockchain) Iterator() *BlockchainIterator {
+	return &BlockchainIterator{bc.Tip, bc.DB}
+}
+
+func (i *BlockchainIterator) Next() *Block {
+	var block *Block
+	err := i.DB.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(blocksBucket))
+		encodedBlock := b.Get(i.CurrentHash)
+		block = DeserializeBlock(encodedBlock)
+		return nil
+	})
+	if err != nil {
+		log.Panic(err)
+	}
+	i.CurrentHash = block.PrevHash
+	return block
+}
+
+// 查找UTXO
+func (bc *Blockchain) FindSpendableOutputs(pubKeyHash []byte, amount int) (int, map[string][]int) {
+	unspentOuts := make(map[string][]int)
+	accumulated := 0
+	spentTXOs := make(map[string][]int)
+	bci := bc.Iterator()
+
+	for {
+		block := bci.Next()
+
+		for _, tx := range block.Transactions {
+			txID := hex.EncodeToString(tx.ID)
+		Outputs:
+			for outIdx, out := range tx.Vout {
+				if spentTXOs[txID] != nil {
+					for _, spentOut := range spentTXOs[txID] {
+						if spentOut == outIdx {
+							continue Outputs
+						}
+					}
+				}
+				if out.IsLockedWithKey(pubKeyHash) && accumulated < amount {
+					accumulated += out.Value
+					unspentOuts[txID] = append(unspentOuts[txID], outIdx)
+					if accumulated >= amount {
+						break
+					}
+				}
+			}
+
+			if !tx.IsCoinbase() {
+				for _, in := range tx.Vin {
+					if bytes.Equal(HashPubKey(in.PubKey), pubKeyHash) {
+						inTxID := hex.EncodeToString(in.Txid)
+						spentTXOs[inTxID] = append(spentTXOs[inTxID], in.OutIndex)
+					}
+				}
+			}
+		}
+		if len(block.PrevHash) == 0 {
+			break
+		}
+	}
+
+	return accumulated, unspentOuts
+}
+
+// 根据交易ID查找交易
+func (bc *Blockchain) FindTransaction(ID []byte) (Transaction, error) {
+	bci := bc.Iterator()
+
+	for {
+		block := bci.Next()
+
+		for _, tx := range block.Transactions {
+			if bytes.Equal(tx.ID, ID) {
+				return *tx, nil
+			}
+		}
+
+		if len(block.PrevHash) == 0 {
+			break
+		}
+	}
+
+	return Transaction{}, fmt.Errorf("交易 %x 未找到", ID)
+}
+
+func (bc *Blockchain) PrintBlockchain() {
+	bci := bc.Iterator()
+	fmt.Println("=== 开始遍历区块链 ===")
+
+	for {
+		block := bci.Next()
+		fmt.Printf("\n--- 区块 ---\n")
+		fmt.Printf("Hash: %x\n", block.Hash)
+		fmt.Printf("PrevHash: %x\n", block.PrevHash)
+		fmt.Printf("时间戳: %d\n", block.Timestamp)
+		fmt.Printf("高度: %d\n", block.Height)
+
+		for i, tx := range block.Transactions {
+			fmt.Printf("  交易 %d:\n", i)
+			fmt.Printf("    ID: %x\n", tx.ID)
+			if tx.IsCoinbase() {
+				fmt.Println("    Coinbase交易（挖矿奖励）")
+			}
+
+			for j, in := range tx.Vin {
+				fmt.Printf("    输入 %d:\n", j)
+				fmt.Printf("      TxID: %x\n", in.Txid)
+				fmt.Printf("      OutIndex: %d\n", in.OutIndex)
+				fmt.Printf("      PubKey: %x\n", in.PubKey)
+				fmt.Printf("      Signature: %x\n", in.Signature)
+			}
+
+			for j, out := range tx.Vout {
+				fmt.Printf("    输出 %d:\n", j)
+				fmt.Printf("      金额: %d\n", out.Value)
+				fmt.Printf("      公钥哈希: %x\n", out.PubKeyHash)
+			}
+		}
+
+		if len(block.PrevHash) == 0 {
+			break
+		}
+	}
+
+	fmt.Println("=== 遍历结束 ===")
+}
+
+func (bc *Blockchain) GetBlock(hash []byte) (*Block, error) {
+	var block *Block
+	err := bc.DB.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(blocksBucket))
+		data := b.Get(hash)
+		block = DeserializeBlock(data)
+		return nil
+	})
+	return block, err
+}
+
+func getBestHeight(bc *Blockchain) int {
+	height := 0
+	bci := bc.Iterator()
+	for {
+		block := bci.Next()
+		height++
+		if len(block.PrevHash) == 0 {
+			break
+		}
+	}
+	return height
+}
+
+func nodeIsKnown(addr string) bool {
+	for _, node := range knownNodes {
+		if node == addr {
+			return true
+		}
+	}
+	return false
+}
+
+func sendGetBlocks(addr string) {
+	// 教学简化：实际应发送区块列表请求
+}
+
+func (bc *Blockchain) AddBlockFromNetwork(block *Block) {
+	err := bc.DB.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(blocksBucket))
+
+		// 如果已经有这个区块就不重复存
+		if b.Get(block.Hash) != nil {
+			return nil
+		}
+
+		err := b.Put(block.Hash, block.Serialize())
+		if err != nil {
+			return err
+		}
+
+		lastHash := b.Get([]byte("l"))
+		lastBlockData := b.Get(lastHash)
+		lastBlock := DeserializeBlock(lastBlockData)
+
+		// 如果新区块更高，更新 tip
+		if block.Timestamp > lastBlock.Timestamp {
+			b.Put([]byte("l"), block.Hash)
+			bc.Tip = block.Hash
+		}
+
+		return nil
+	})
+	if err != nil {
+		log.Panic(err)
+	}
+}
+
+func (bc *Blockchain) MineBlock(txs []*Transaction) *Block {
+	var lastHash []byte
+	var lastHeight int
+
+	err := bc.DB.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(blocksBucket))
+		lastHash = b.Get([]byte("l"))
+		blockData := b.Get(lastHash)
+		block := DeserializeBlock(blockData)
+		lastHeight = block.Height
+		return nil
+	})
+	if err != nil {
+		log.Panic(err)
+	}
+
+	newBlock := NewBlock(txs, lastHash, time.Now().Unix(), lastHeight+1)
+
+	err = bc.DB.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(blocksBucket))
+		b.Put(newBlock.Hash, newBlock.Serialize())
+		b.Put([]byte("l"), newBlock.Hash)
+		bc.Tip = newBlock.Hash
+		return nil
+	})
+
+	return newBlock
+}
+
+
+===== cli_mine.go =====
+package main
+
+import "fmt"
+
+func MineBlock(nodeID string) {
+	bc := NewBlockchain(nodeID)
+	defer bc.DB.Close()
+
+	cbTx := NewCoinbaseTX("miner", "CLI Mine Reward")
+	block := bc.MineBlock([]*Transaction{cbTx})
+
+	fmt.Println("⛏️  挖出新区块成功!")
+	fmt.Printf("高度: %d\n", block.Height)
+	fmt.Printf("Hash: %x\n", block.Hash)
+}
+
+func PrintChain(nodeID string) {
+	bc := NewBlockchain(nodeID)
+	defer bc.DB.Close()
+
+	bc.PrintBlockchain()
+}
+
+func Send(from, to string, amount int, nodeID string) {
+	bc := NewBlockchain(nodeID)
+	defer bc.DB.Close()
+
+	tx := NewUTXOTransaction(from, to, amount, bc)
+
+	SendTx("localhost:"+nodeID, tx)
+
+	fmt.Println("✅ 交易已创建并广播")
+}
+
+func MineAndBroadcastBlock(bc *Blockchain, nodeID string) {
+	fmt.Println("⛏️  节点", nodeID, "开始挖矿...")
+
+	cbTx := NewCoinbaseTX("miner", "")
+	newBlock := bc.MineBlock([]*Transaction{cbTx})
+
+	fmt.Println("✅ 挖矿成功，高度:", newBlock.Height)
+
+	for _, node := range knownNodes {
+		if node != "localhost:"+nodeID {
+			SendInv(node, "block", [][]byte{newBlock.Hash})
+		}
+	}
+}
+
+
+===== handlers.go =====
+package main
+
+import (
+	"bytes"
+	"encoding/gob"
+	"encoding/hex"
+	"fmt"
+	"log"
+)
+
+func decodePayload(data []byte, v interface{}) {
+	dec := gob.NewDecoder(bytes.NewReader(data))
+	dec.Decode(v)
+}
+
+func sendVersion(addr string, bc *Blockchain) {
+	bestHeight := getBestHeight(bc)
+	payload := gobEncode(Version{nodeVersion, bestHeight, nodeAddress})
+	request := append(commandToBytes("version"), payload...)
+	sendData(addr, request)
+}
+
+func handleVersion(request []byte, bc *Blockchain) {
+	var payload Version
+	decodePayload(request[12:], &payload)
+
+	myHeight := getBestHeight(bc)
+
+	if payload.BestHeight > myHeight {
+		sendGetBlocks(payload.AddrFrom)
+	} else if payload.BestHeight < myHeight {
+		sendVersion(payload.AddrFrom, bc)
+	}
+
+	if !nodeIsKnown(payload.AddrFrom) {
+		knownNodes = append(knownNodes, payload.AddrFrom)
+	}
+}
+
+func SendInv(addr, kind string, items [][]byte) {
+	payload := gobEncode(Inv{nodeAddress, kind, items})
+	request := append(commandToBytes("inv"), payload...)
+	sendData(addr, request)
+}
+
+func handleInv(request []byte, bc *Blockchain) {
+	var payload Inv
+	decodePayload(request[12:], &payload)
+
+	if payload.Type == "block" {
+		blocksInTransit = payload.Items
+		blockHash := payload.Items[0]
+		sendGetData(payload.AddrFrom, "block", blockHash)
+	}
+}
+
+func sendGetData(addr, kind string, id []byte) {
+	payload := gobEncode(GetData{nodeAddress, kind, id})
+	request := append(commandToBytes("getdata"), payload...)
+	sendData(addr, request)
+}
+
+func handleGetData(request []byte, bc *Blockchain) {
+	var payload GetData
+	decodePayload(request[12:], &payload)
+
+	if payload.Type == "block" {
+		block, _ := bc.GetBlock(payload.ID)
+		data := gobEncode(BlockData{nodeAddress, block.Serialize()})
+		request := append(commandToBytes("block"), data...)
+		sendData(payload.AddrFrom, request)
+	}
+}
+
+func handleBlock(request []byte, bc *Blockchain) {
+	fmt.Println("📦 收到新区块，通知停止挖矿")
+	miningInterrupt <- true
+
+	var payload BlockData
+	decodePayload(request[12:], &payload)
+
+	block := DeserializeBlock(payload.Block)
+	fmt.Println("⛓️ 收到新区块:", block.Hash)
+
+	bc.AddBlockFromNetwork(block)
+
+	fmt.Printf("当前区块高度: %d\n", getBestHeight(bc))
+}
+
+func handleTx(request []byte, bc *Blockchain) {
+	var payload tx
+
+	buff := bytes.NewBuffer(request[12:])
+	dec := gob.NewDecoder(buff)
+	err := dec.Decode(&payload)
+	if err != nil {
+		log.Panic(err)
+	}
+
+	txData := payload.Transaction
+	transaction := DeserializeTransaction(txData)
+
+	mempool[hex.EncodeToString(transaction.ID)] = transaction
+
+	fmt.Println("📥 收到新交易，已加入交易池")
+
+	// 继续向其他节点广播
+	for _, node := range knownNodes {
+		if node != nodeAddress && node != payload.AddrFrom {
+			SendTx(node, &transaction)
+		}
+	}
+}
+
+
+===== main.go =====
+package main
+
+import (
+	"encoding/hex"
+	"fmt"
+	"os"
+	"strconv"
+	"time"
+)
+
+func main() {
+	nodeID := os.Args[1]
+
+	if len(os.Args) > 2 {
+		switch os.Args[2] {
+		case "mine":
+			MineBlock(nodeID)
+			return
+		case "getchain":
+			PrintChain(nodeID)
+			return
+		case "send":
+			from := os.Args[3]
+			to := os.Args[4]
+			amount, _ := strconv.Atoi(os.Args[5])
+			Send(from, to, amount, nodeID)
+			return
+		}
+	}
+
+	address := "miner"
+	bc := CreateBlockchain(address, nodeID)
+	go func() {
+		fmt.Println("🟢 自动挖矿线程已启动")
+
+		for {
+			time.Sleep(10 * time.Second)
+
+			if len(mempool) == 0 {
+				continue
+			}
+
+			var txs []*Transaction
+
+			for _, tx := range mempool {
+				txs = append(txs, &tx)
+			}
+
+			cbTx := NewCoinbaseTX("miner-"+nodeID, "")
+			txs = append(txs, cbTx)
+
+			newBlock := bc.MineBlock(txs)
+
+			fmt.Println("⛏️ 打包交易挖出新区块，高度:", newBlock.Height)
+
+			// 清空已打包交易
+			for _, tx := range txs {
+				txID := hex.EncodeToString(tx.ID)
+				delete(mempool, txID)
+			}
+
+			for _, node := range knownNodes {
+				if node != nodeAddress {
+					SendInv(node, "block", [][]byte{newBlock.Hash})
+				}
+			}
+		}
+	}()
+
+	/*go func() {
+		for {
+			time.Sleep(20 * time.Second)
+			MineAndBroadcastBlock(bc, nodeID)
+		}
+	}()*/
+	StartServer(nodeID, bc)
+
+}
+
+/*
+func main() {
+	// 创建钱包
+	aliceWallet := NewWallet()
+	bobWallet := NewWallet()
+
+	aliceAddr := string(aliceWallet.PublicKey)
+	bobAddr := string(bobWallet.PublicKey)
+
+	// 创建区块链
+	bc := CreateBlockchain(aliceAddr)
+
+	// 创世块余额
+	fmt.Println("Alice创世块余额:", 100)
+
+	// Alice转账给Bob 30
+	tx := NewUTXOTransaction(aliceAddr, bobAddr, 30, bc)
+	bc.AddBlock([]*Transaction{tx})
+
+	fmt.Println("Alice -> Bob 30 转账完成")
+
+	// 遍历区块链打印
+	bci := bc.Iterator()
+	for {
+		block := bci.Next()
+		fmt.Printf("\n=== 区块 ===\nHash: %x\nPrevHash: %x\n", block.Hash, block.PrevHash)
+		for i, tx := range block.Transactions {
+			fmt.Printf("  交易 %d\n", i)
+			for j, out := range tx.Vout {
+				fmt.Printf("    输出 %d 金额: %d\n", j, out.Value)
+			}
+		}
+		if len(block.PrevHash) == 0 {
+			break
+		}
+	}
+
+	bc.PrintBlockchain()
+}
+*/
+
+
+===== message.go =====
+package main
+
+type Version struct {
+	Version    int
+	BestHeight int
+	AddrFrom   string
+}
+
+type Inv struct {
+	AddrFrom string
+	Type     string
+	Items    [][]byte
+}
+
+type GetData struct {
+	AddrFrom string
+	Type     string
+	ID       []byte
+}
+
+type BlockData struct {
+	AddrFrom string
+	Block    []byte
+}
+
+type tx struct {
+	AddrFrom    string
+	Transaction []byte
+}
+
+
+===== network_utils.go =====
+package main
+
+import (
+	"bytes"
+	"encoding/gob"
+	"fmt"
+	"log"
+	"net"
+)
+
+func commandToBytes(command string) []byte {
+	var bytes [12]byte
+	copy(bytes[:], command)
+	return bytes[:]
+}
+
+func bytesToCommand(bytes []byte) string {
+	var command []byte
+	for _, b := range bytes {
+		if b != 0x0 {
+			command = append(command, b)
+		}
+	}
+	return fmt.Sprintf("%s", command)
+}
+
+func gobEncode(data interface{}) []byte {
+	var buff bytes.Buffer
+	enc := gob.NewEncoder(&buff)
+	err := enc.Encode(data)
+	if err != nil {
+		log.Panic(err)
+	}
+	return buff.Bytes()
+}
+
+func sendData(addr string, data []byte) {
+	conn, err := net.Dial(protocol, addr)
+	if err != nil {
+		fmt.Printf("❌ 无法连接节点 %s\n", addr)
+		return
+	}
+	defer conn.Close()
+	conn.Write(data)
+}
+
+func SendTx(addr string, tnx *Transaction) {
+	data := tx{nodeAddress, tnx.Serialize()}
+	payload := gobEncode(data)
+	request := append(commandToBytes("tx"), payload...)
+
+	sendData(addr, request)
+}
+
+
+===== pow.go =====
+package main
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"fmt"
+	"math/big"
+)
+
+const targetBits = 16 // 难度值，越小越难
+
+type ProofOfWork struct {
+	block  *Block
+	target *big.Int
+}
+
+// 创建 PoW
+func NewProofOfWork(b *Block) *ProofOfWork {
+	target := big.NewInt(1)
+	target.Lsh(target, 256-targetBits)
+	return &ProofOfWork{b, target}
+}
+
+// 准备参与哈希的数据
+func (pow *ProofOfWork) prepareData(nonce int) []byte {
+	data := bytes.Join(
+		[][]byte{
+			pow.block.PrevHash,
+			HashTransactions(pow.block.Transactions),
+			IntToHex(pow.block.Timestamp),
+			IntToHex(int64(targetBits)),
+			IntToHex(int64(nonce)),
+		},
+		[]byte{},
+	)
+	return data
+}
+
+// 挖矿
+func (pow *ProofOfWork) Run() (int, []byte) {
+	var hashInt big.Int
+	var hash [32]byte
+	nonce := 0
+
+	fmt.Println("⛏️  开始挖矿...")
+
+	for {
+		select {
+		case <-miningInterrupt:
+			fmt.Println("🛑 挖矿被中断，发现新区块")
+			return 0, []byte{}
+		default:
+		}
+
+		data := pow.prepareData(nonce)
+		hash = sha256.Sum256(data)
+		hashInt.SetBytes(hash[:])
+
+		if hashInt.Cmp(pow.target) == -1 {
+			break
+		} else {
+			nonce++
+		}
+	}
+
+	fmt.Printf("✅ 挖矿成功: %x\n", hash)
+	return nonce, hash[:]
+}
+
+// 校验区块是否合法
+func (pow *ProofOfWork) Validate() bool {
+	var hashInt big.Int
+	data := pow.prepareData(pow.block.Nonce)
+	hash := sha256.Sum256(data)
+	hashInt.SetBytes(hash[:])
+	return hashInt.Cmp(pow.target) == -1
+}
+
+
+===== server.go =====
+package main
+
+import (
+	"fmt"
+	"io"
+	"log"
+	"net"
+)
+
+const protocol = "tcp"
+const nodeVersion = 1
+
+var nodeAddress string
+var knownNodes = []string{"localhost:3000"} // 种子节点
+var blocksInTransit = [][]byte{}
+var mempool = make(map[string]Transaction)
+var miningInterrupt = make(chan bool)
+
+func StartServer(nodeID string, bc *Blockchain) {
+	nodeAddress = fmt.Sprintf("localhost:%s", nodeID)
+	ln, err := net.Listen(protocol, nodeAddress)
+	if err != nil {
+		log.Panic(err)
+	}
+	defer ln.Close()
+
+	fmt.Printf("🌐 节点已启动: %s\n", nodeAddress)
+
+	if nodeAddress != knownNodes[0] {
+		sendVersion(knownNodes[0], bc)
+	}
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			log.Panic(err)
+		}
+		go handleConnection(conn, bc)
+	}
+}
+
+func handleConnection(conn net.Conn, bc *Blockchain) {
+	defer conn.Close()
+	request, err := io.ReadAll(conn)
+	if err != nil {
+		log.Panic(err)
+	}
+
+	command := bytesToCommand(request[:12])
+	fmt.Printf("📩 收到命令: %s\n", command)
+
+	switch command {
+	case "version":
+		handleVersion(request, bc)
+	case "inv":
+		handleInv(request, bc)
+	case "getdata":
+		handleGetData(request, bc)
+	case "block":
+		handleBlock(request, bc)
+	case "tx":
+		handleTx(request, bc)
+	default:
+		fmt.Println("未知命令")
+	}
+}
+
+
+===== transaction.go =====
+package main
+
+import (
+	"bytes"
+	"encoding/gob"
+	"log"
+)
+
+type Transaction struct {
+	ID   []byte
+	Vin  []TXInput
+	Vout []TXOutput
+}
+
+type TXInput struct {
+	Txid      []byte
+	OutIndex  int
+	Signature []byte
+	PubKey    []byte
+}
+
+type TXOutput struct {
+	Value      int
+	PubKeyHash []byte
+}
+
+// Coinbase判断
+func (tx *Transaction) IsCoinbase() bool {
+	return len(tx.Vin) == 1 && len(tx.Vin[0].Txid) == 0 && tx.Vin[0].OutIndex == -1
+}
+
+// 设置ID
+func (tx *Transaction) SetID() {
+	var encoded bytes.Buffer
+	enc := gob.NewEncoder(&encoded)
+	err := enc.Encode(tx)
+	if err != nil {
+		log.Panic(err)
+	}
+	tx.ID = Sha256(encoded.Bytes())
+}
+
+// 创建UTXO输出
+func NewTXOutput(value int, address string) *TXOutput {
+	txo := &TXOutput{value, nil}
+	txo.Lock([]byte(address))
+	return txo
+}
+
+// 输出锁定到某个地址
+func (out *TXOutput) Lock(address []byte) {
+	out.PubKeyHash = HashPubKey(address)
+}
+
+// 判断是否属于某人
+func (out *TXOutput) IsLockedWithKey(pubKeyHash []byte) bool {
+	return bytes.Equal(out.PubKeyHash, pubKeyHash)
+}
+
+// Coinbase交易
+func NewCoinbaseTX(to, data string) *Transaction {
+	if data == "" {
+		data = "Block reward"
+	}
+	txin := TXInput{[]byte{}, -1, nil, []byte(data)}
+	txout := NewTXOutput(100, to)
+	tx := Transaction{nil, []TXInput{txin}, []TXOutput{*txout}}
+	tx.SetID()
+	return &tx
+}
+
+func DeserializeTransaction(data []byte) Transaction {
+	var transaction Transaction
+
+	decoder := gob.NewDecoder(bytes.NewReader(data))
+	err := decoder.Decode(&transaction)
+	if err != nil {
+		log.Panic(err)
+	}
+
+	return transaction
+}
+
+func (tx *Transaction) Serialize() []byte {
+	var encoded bytes.Buffer
+
+	enc := gob.NewEncoder(&encoded)
+	err := enc.Encode(tx)
+	if err != nil {
+		log.Panic(err)
+	}
+
+	return encoded.Bytes()
+}
+
+
+===== transaction_create.go =====
+package main
+
+import (
+	"encoding/hex"
+	"log"
+)
+
+// 创建一笔UTXO转账交易
+func NewUTXOTransaction(from, to string, amount int, bc *Blockchain) *Transaction {
+	var inputs []TXInput
+	var outputs []TXOutput
+
+	// 获取钱包
+	wallet := NewWallet() // 注意：在完整项目中你应该用钱包管理器获取已有钱包
+	pubKeyHash := HashPubKey([]byte(from))
+
+	// 查找可用 UTXO
+	acc, validOutputs := bc.FindSpendableOutputs(pubKeyHash, amount)
+	if acc < amount {
+		log.Panic("余额不足")
+	}
+
+	// 构建输入
+	for txid, outs := range validOutputs {
+		txID, _ := hex.DecodeString(txid)
+		for _, outIdx := range outs {
+			input := TXInput{txID, outIdx, nil, []byte(from)}
+			inputs = append(inputs, input)
+		}
+	}
+
+	// 构建输出
+	outputs = append(outputs, *NewTXOutput(amount, to))
+	if acc > amount {
+		// 找零给自己
+		outputs = append(outputs, *NewTXOutput(acc-amount, from))
+	}
+
+	// 创建交易
+	tx := Transaction{nil, inputs, outputs}
+	tx.SetID()
+
+	// 签名交易
+	prevTXs := make(map[string]Transaction)
+	for txid := range validOutputs {
+		txInBytes, _ := hex.DecodeString(txid)
+		prevTx, _ := bc.FindTransaction(txInBytes)
+		prevTXs[txid] = prevTx
+	}
+	tx.Sign(wallet.PrivateKey, prevTXs)
+
+	return &tx
+}
+
+
+===== transaction_sign.go =====
+package main
+
+import (
+	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"encoding/gob"
+	"encoding/hex"
+	"log"
+	"math/big"
+)
+
+// 生成交易拷贝用于签名
+func (tx *Transaction) TrimmedCopy() Transaction {
+	var inputs []TXInput
+	var outputs []TXOutput
+	for _, vin := range tx.Vin {
+		inputs = append(inputs, TXInput{vin.Txid, vin.OutIndex, nil, nil})
+	}
+	for _, vout := range tx.Vout {
+		outputs = append(outputs, TXOutput{vout.Value, vout.PubKeyHash})
+	}
+	return Transaction{tx.ID, inputs, outputs}
+}
+
+// 对交易签名
+func (tx *Transaction) Sign(privKey ecdsa.PrivateKey, prevTXs map[string]Transaction) {
+	if tx.IsCoinbase() {
+		return
+	}
+
+	txCopy := tx.TrimmedCopy()
+	for inIdx, vin := range txCopy.Vin {
+		prevTx := prevTXs[hex.EncodeToString(vin.Txid)]
+		txCopy.Vin[inIdx].PubKey = prevTx.Vout[vin.OutIndex].PubKeyHash
+		hash := txCopy.Hash()
+		r, s, err := ecdsa.Sign(rand.Reader, &privKey, hash)
+		if err != nil {
+			log.Panic(err)
+		}
+		signature := append(r.Bytes(), s.Bytes()...)
+		tx.Vin[inIdx].Signature = signature
+		txCopy.Vin[inIdx].PubKey = nil
+	}
+}
+
+// 验证交易
+func (tx *Transaction) Verify(prevTXs map[string]Transaction) bool {
+	if tx.IsCoinbase() {
+		return true
+	}
+
+	txCopy := tx.TrimmedCopy()
+	curve := elliptic.P256()
+
+	for inIdx, vin := range tx.Vin {
+		prevTx := prevTXs[hex.EncodeToString(vin.Txid)]
+		txCopy.Vin[inIdx].PubKey = prevTx.Vout[vin.OutIndex].PubKeyHash
+		hash := txCopy.Hash()
+
+		r := big.Int{}
+		s := big.Int{}
+		sigLen := len(vin.Signature)
+		r.SetBytes(vin.Signature[:sigLen/2])
+		s.SetBytes(vin.Signature[sigLen/2:])
+
+		x := big.Int{}
+		y := big.Int{}
+		keyLen := len(vin.PubKey)
+		x.SetBytes(vin.PubKey[:keyLen/2])
+		y.SetBytes(vin.PubKey[keyLen/2:])
+		rawPubKey := ecdsa.PublicKey{Curve: curve, X: &x, Y: &y}
+
+		if !ecdsa.Verify(&rawPubKey, hash, &r, &s) {
+			return false
+		}
+		txCopy.Vin[inIdx].PubKey = nil
+	}
+	return true
+}
+
+// 计算交易hash
+func (tx *Transaction) Hash() []byte {
+	var encoded bytes.Buffer
+	enc := gob.NewEncoder(&encoded)
+	err := enc.Encode(tx)
+	if err != nil {
+		log.Panic(err)
+	}
+	return Sha256(encoded.Bytes())
+}
+
+
+===== utils.go =====
+package main
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/binary"
+	"golang.org/x/crypto/ripemd160"
+	"log"
+)
+
+// Sha256 计算哈希
+func Sha256(data []byte) []byte {
+	hash := sha256.Sum256(data)
+	return hash[:]
+}
+
+// HashPubKey 对公钥做 HASH160（SHA256 + RIPEMD160）
+func HashPubKey(pubKey []byte) []byte {
+	pubSHA256 := Sha256(pubKey)
+
+	ripemdHasher := ripemd160.New()
+	ripemdHasher.Write(pubSHA256)
+	pubRIPEMD160 := ripemdHasher.Sum(nil)
+
+	return pubRIPEMD160
+}
+
+// int64 转 []byte
+func IntToHex(num int64) []byte {
+	buff := new(bytes.Buffer)
+	err := binary.Write(buff, binary.BigEndian, num)
+	if err != nil {
+		log.Panic(err)
+	}
+	return buff.Bytes()
+}
+
+// 把区块中所有交易做一次hash
+func HashTransactions(txs []*Transaction) []byte {
+	var txHashes [][]byte
+	for _, tx := range txs {
+		txHashes = append(txHashes, tx.ID)
+	}
+	data := bytes.Join(txHashes, []byte{})
+	hash := Sha256(data)
+	return hash
+}
+
+
+===== wallet.go =====
+package main
+
+import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"log"
+)
+
+type Wallet struct {
+	PrivateKey ecdsa.PrivateKey
+	PublicKey  []byte
+}
+
+func NewWallet() *Wallet {
+	priv, pub := newKeyPair()
+	return &Wallet{priv, pub}
+}
+
+func newKeyPair() (ecdsa.PrivateKey, []byte) {
+	curve := elliptic.P256()
+	priv, err := ecdsa.GenerateKey(curve, rand.Reader)
+	if err != nil {
+		log.Panic(err)
+	}
+	pub := append(priv.PublicKey.X.Bytes(), priv.PublicKey.Y.Bytes()...)
+	return *priv, pub
+}
+
+
