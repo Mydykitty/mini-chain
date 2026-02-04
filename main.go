@@ -46,7 +46,7 @@ func main() {
 				txs = append(txs, &tx)
 			}
 
-			cbTx := NewCoinbaseTX("miner-"+nodeID, "") // todo 需要加nodeID么
+			cbTx := NewCoinbaseTX("miner-"+nodeID, "")
 			txs = append(txs, cbTx)
 
 			newBlock := bc.MineBlock(txs)
