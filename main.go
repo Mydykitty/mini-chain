@@ -1,7 +1,36 @@
 package main
 
-import "fmt"
+import (
+	"os"
+)
 
+func main() {
+	nodeID := os.Args[1]
+
+	if len(os.Args) > 2 {
+		switch os.Args[2] {
+		case "mine":
+			MineBlock(nodeID)
+			return
+		case "getchain":
+			PrintChain(nodeID)
+			return
+		}
+	}
+
+	address := "miner"
+	bc := CreateBlockchain(address, nodeID)
+	/*go func() {
+		for {
+			time.Sleep(20 * time.Second)
+			MineAndBroadcastBlock(bc, nodeID)
+		}
+	}()*/
+	StartServer(nodeID, bc)
+
+}
+
+/*
 func main() {
 	// 创建钱包
 	aliceWallet := NewWallet()
@@ -40,3 +69,4 @@ func main() {
 
 	bc.PrintBlockchain()
 }
+*/

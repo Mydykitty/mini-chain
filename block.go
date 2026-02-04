@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/gob"
 	"log"
-	"time"
 )
 
 type Block struct {
@@ -13,19 +12,32 @@ type Block struct {
 	PrevHash     []byte
 	Hash         []byte
 	Nonce        int
+	Height       int // 👈 新增：区块高度
 }
 
 // 创建新区块
-func NewBlock(txs []*Transaction, prevHash []byte) *Block {
-	block := &Block{time.Now().Unix(), txs, prevHash, []byte{}, 0}
-	hash := block.HashBlock()
-	block.Hash = hash
+func NewBlock(txs []*Transaction, prevHash []byte, timeUnix int64, height int) *Block {
+	block := &Block{
+		Timestamp:    timeUnix,
+		Transactions: txs,
+		PrevHash:     prevHash,
+		Hash:         []byte{},
+		Nonce:        0,
+		Height:       height,
+	}
+
+	pow := NewProofOfWork(block)
+	nonce, hash := pow.Run()
+
+	block.Hash = hash[:]
+	block.Nonce = nonce
+
 	return block
 }
 
 // 创世块
 func NewGenesisBlock(coinbase *Transaction) *Block {
-	return NewBlock([]*Transaction{coinbase}, []byte{})
+	return NewBlock([]*Transaction{coinbase}, []byte{}, 1700000000, 0)
 }
 
 // 序列化
@@ -48,16 +60,4 @@ func DeserializeBlock(d []byte) *Block {
 		log.Panic(err)
 	}
 	return &block
-}
-
-// 简单 hash 作为演示
-func (b *Block) HashBlock() []byte {
-	var encoded bytes.Buffer
-	enc := gob.NewEncoder(&encoded)
-	err := enc.Encode(b)
-	if err != nil {
-		log.Panic(err)
-	}
-	hash := Sha256(encoded.Bytes())
-	return hash
 }

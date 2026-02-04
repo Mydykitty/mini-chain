@@ -5,20 +5,24 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log"
+	"os"
+	"time"
 
 	bolt "go.etcd.io/bbolt"
 )
 
 const blocksBucket = "blocks"
+const dbFile = "blockchain_%s.db"
 
 type Blockchain struct {
 	Tip []byte
 	DB  *bolt.DB
 }
 
-// 创建区块链
-func CreateBlockchain(address string) *Blockchain {
-	db, err := bolt.Open("blockchain.db", 0600, nil)
+func CreateBlockchain(address, nodeID string) *Blockchain {
+	dbFileStr := fmt.Sprintf(dbFile, nodeID)
+
+	db, err := bolt.Open(dbFileStr, 0600, nil)
 	if err != nil {
 		log.Panic(err)
 	}
@@ -46,20 +50,51 @@ func CreateBlockchain(address string) *Blockchain {
 	return &Blockchain{tip, db}
 }
 
-// 添加新区块
-func (bc *Blockchain) AddBlock(transactions []*Transaction) {
-	var lastHash []byte
+func NewBlockchain(nodeID string) *Blockchain {
+	dbFileStr := fmt.Sprintf(dbFile, nodeID)
 
-	err := bc.DB.View(func(tx *bolt.Tx) error {
+	if _, err := os.Stat(dbFileStr); os.IsNotExist(err) {
+		fmt.Println("❌ 区块链不存在，请先创建创世区块")
+		os.Exit(1)
+	}
+
+	var tip []byte
+	db, err := bolt.Open(dbFileStr, 0600, nil)
+	if err != nil {
+		log.Panic(err)
+	}
+
+	err = db.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(blocksBucket))
-		lastHash = b.Get([]byte("l"))
+		tip = b.Get([]byte("l"))
 		return nil
 	})
 	if err != nil {
 		log.Panic(err)
 	}
 
-	newBlock := NewBlock(transactions, lastHash)
+	bc := Blockchain{tip, db}
+	return &bc
+}
+
+// 添加新区块
+func (bc *Blockchain) AddBlock(transactions []*Transaction) {
+	var lastHash []byte
+	var lastHeight int
+
+	err := bc.DB.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(blocksBucket))
+		lastHash = b.Get([]byte("l"))
+		blockData := b.Get(lastHash)
+		block := DeserializeBlock(blockData)
+		lastHeight = block.Height
+		return nil
+	})
+	if err != nil {
+		log.Panic(err)
+	}
+
+	newBlock := NewBlock(transactions, lastHash, time.Now().Unix(), lastHeight+1)
 
 	err = bc.DB.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(blocksBucket))
@@ -202,4 +237,101 @@ func (bc *Blockchain) PrintBlockchain() {
 	}
 
 	fmt.Println("=== 遍历结束 ===")
+}
+
+func (bc *Blockchain) GetBlock(hash []byte) (*Block, error) {
+	var block *Block
+	err := bc.DB.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(blocksBucket))
+		data := b.Get(hash)
+		block = DeserializeBlock(data)
+		return nil
+	})
+	return block, err
+}
+
+func getBestHeight(bc *Blockchain) int {
+	height := 0
+	bci := bc.Iterator()
+	for {
+		block := bci.Next()
+		height++
+		if len(block.PrevHash) == 0 {
+			break
+		}
+	}
+	return height
+}
+
+func nodeIsKnown(addr string) bool {
+	for _, node := range knownNodes {
+		if node == addr {
+			return true
+		}
+	}
+	return false
+}
+
+func sendGetBlocks(addr string) {
+	// 教学简化：实际应发送区块列表请求
+}
+
+func (bc *Blockchain) AddBlockFromNetwork(block *Block) {
+	err := bc.DB.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(blocksBucket))
+
+		// 如果已经有这个区块就不重复存
+		if b.Get(block.Hash) != nil {
+			return nil
+		}
+
+		err := b.Put(block.Hash, block.Serialize())
+		if err != nil {
+			return err
+		}
+
+		lastHash := b.Get([]byte("l"))
+		lastBlockData := b.Get(lastHash)
+		lastBlock := DeserializeBlock(lastBlockData)
+
+		// 如果新区块更高，更新 tip
+		if block.Timestamp > lastBlock.Timestamp {
+			b.Put([]byte("l"), block.Hash)
+			bc.Tip = block.Hash
+		}
+
+		return nil
+	})
+	if err != nil {
+		log.Panic(err)
+	}
+}
+
+func (bc *Blockchain) MineBlock(txs []*Transaction) *Block {
+	var lastHash []byte
+	var lastHeight int
+
+	err := bc.DB.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(blocksBucket))
+		lastHash = b.Get([]byte("l"))
+		blockData := b.Get(lastHash)
+		block := DeserializeBlock(blockData)
+		lastHeight = block.Height
+		return nil
+	})
+	if err != nil {
+		log.Panic(err)
+	}
+
+	newBlock := NewBlock(txs, lastHash, time.Now().Unix(), lastHeight+1)
+
+	err = bc.DB.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(blocksBucket))
+		b.Put(newBlock.Hash, newBlock.Serialize())
+		b.Put([]byte("l"), newBlock.Hash)
+		bc.Tip = newBlock.Hash
+		return nil
+	})
+
+	return newBlock
 }
