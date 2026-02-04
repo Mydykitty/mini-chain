@@ -208,6 +208,7 @@ func (bc *Blockchain) PrintBlockchain() {
 		fmt.Printf("Hash: %x\n", block.Hash)
 		fmt.Printf("PrevHash: %x\n", block.PrevHash)
 		fmt.Printf("时间戳: %d\n", block.Timestamp)
+		fmt.Printf("高度: %d\n", block.Height)
 
 		for i, tx := range block.Transactions {
 			fmt.Printf("  交易 %d:\n", i)

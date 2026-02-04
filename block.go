@@ -37,7 +37,7 @@ func NewBlock(txs []*Transaction, prevHash []byte, timeUnix int64, height int) *
 
 // 创世块
 func NewGenesisBlock(coinbase *Transaction) *Block {
-	return NewBlock([]*Transaction{coinbase}, []byte{}, 1700000000, 0)
+	return NewBlock([]*Transaction{coinbase}, []byte{}, 1700000000, 1)
 }
 
 // 序列化
