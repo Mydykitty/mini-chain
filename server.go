@@ -12,7 +12,6 @@ const nodeVersion = 1
 
 var nodeAddress string
 var knownNodes = []string{"localhost:3000"} // 种子节点
-var blocksInTransit = [][]byte{}
 var miningInterrupt = make(chan bool)
 
 func StartServer(nodeID string, bc *Blockchain) {

@@ -676,7 +676,11 @@ func main() {
 	nodeID := os.Args[1]
 
 	ws := NewWallets()
+	if ws.GetWallet("miner") == nil {
+		ws.CreateWallet("miner")
+	}
 	myWallet := ws.GetWallet("miner") // 或 miner-3000
+	fmt.Println("address is: ", myWallet.Address())
 
 	if len(os.Args) > 2 {
 		switch os.Args[2] {
@@ -1240,6 +1244,14 @@ import (
 // 创建一笔UTXO转账交易
 func NewUTXOTransaction(from, to string, amount int, bc *Blockchain) *Transaction {
 	ws := NewWallets()
+	// 确保钱包存在
+	if ws.GetWallet(from) == nil {
+		ws.CreateWallet(from)
+	}
+	if ws.GetWallet(to) == nil {
+		ws.CreateWallet(to)
+	}
+
 	fromWallet := ws.GetWallet(from)
 	toWallet := ws.GetWallet(to)
 
