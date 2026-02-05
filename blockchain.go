@@ -19,7 +19,7 @@ type Blockchain struct {
 	DB  *bolt.DB
 }
 
-func CreateBlockchain(address, nodeID string) *Blockchain {
+func CreateBlockchain(toPubKeyHash []byte, nodeID string) *Blockchain {
 	dbFileStr := fmt.Sprintf(dbFile, nodeID)
 
 	db, err := bolt.Open(dbFileStr, 0600, nil)
@@ -33,11 +33,12 @@ func CreateBlockchain(address, nodeID string) *Blockchain {
 		b := tx.Bucket([]byte(blocksBucket))
 
 		if b == nil {
-			genesis := NewGenesisBlock(NewCoinbaseTX(address, "Genesis Block"))
+			genesis := NewGenesisBlock(NewCoinbaseTX(toPubKeyHash, "Genesis Block"))
 			b, _ = tx.CreateBucket([]byte(blocksBucket))
 			b.Put(genesis.Hash, genesis.Serialize())
 			b.Put([]byte("l"), genesis.Hash)
 			tip = genesis.Hash
+			fmt.Println("CreateBlockchain")
 		} else {
 			tip = b.Get([]byte("l"))
 		}
@@ -75,34 +76,6 @@ func NewBlockchain(nodeID string) *Blockchain {
 
 	bc := Blockchain{tip, db}
 	return &bc
-}
-
-// 添加新区块
-func (bc *Blockchain) AddBlock(transactions []*Transaction) {
-	var lastHash []byte
-	var lastHeight int
-
-	err := bc.DB.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(blocksBucket))
-		lastHash = b.Get([]byte("l"))
-		blockData := b.Get(lastHash)
-		block := DeserializeBlock(blockData)
-		lastHeight = block.Height
-		return nil
-	})
-	if err != nil {
-		log.Panic(err)
-	}
-
-	newBlock := NewBlock(transactions, lastHash, time.Now().Unix(), lastHeight+1)
-
-	err = bc.DB.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(blocksBucket))
-		b.Put(newBlock.Hash, newBlock.Serialize())
-		b.Put([]byte("l"), newBlock.Hash)
-		bc.Tip = newBlock.Hash
-		return nil
-	})
 }
 
 // 区块链迭代器
@@ -296,7 +269,7 @@ func (bc *Blockchain) AddBlockFromNetwork(block *Block) {
 		lastBlock := DeserializeBlock(lastBlockData)
 
 		// 如果新区块更高，更新 tip
-		if block.Timestamp > lastBlock.Timestamp {
+		if block.Height > lastBlock.Height {
 			b.Put([]byte("l"), block.Hash)
 			bc.Tip = block.Hash
 		}
@@ -325,6 +298,10 @@ func (bc *Blockchain) MineBlock(txs []*Transaction) *Block {
 	}
 
 	newBlock := NewBlock(txs, lastHash, time.Now().Unix(), lastHeight+1)
+	if newBlock == nil {
+		fmt.Println("⚠️ 本轮挖矿被中断")
+		return nil
+	}
 
 	err = bc.DB.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(blocksBucket))
@@ -335,4 +312,60 @@ func (bc *Blockchain) MineBlock(txs []*Transaction) *Block {
 	})
 
 	return newBlock
+}
+
+func (bc *Blockchain) VerifyTransaction(tx *Transaction) bool {
+	if tx.IsCoinbase() {
+		return true
+	}
+
+	prevTXs := make(map[string]Transaction)
+
+	for _, vin := range tx.Vin {
+		prevTx, err := bc.FindTransaction(vin.Txid)
+		if err != nil {
+			return false
+		}
+
+		// 关键：这个输出是否还没被花费
+		if bc.IsOutputSpent(vin.Txid, vin.OutIndex) {
+			return false
+		}
+
+		prevTXs[hex.EncodeToString(vin.Txid)] = prevTx
+	}
+
+	return tx.Verify(prevTXs)
+}
+
+func (bc *Blockchain) IsOutputSpent(txid []byte, index int) bool {
+	spentTXOs := make(map[string][]int)
+
+	bci := bc.Iterator()
+
+	for {
+		block := bci.Next()
+
+		for _, tx := range block.Transactions {
+			if !tx.IsCoinbase() {
+				for _, vin := range tx.Vin {
+					inTxID := hex.EncodeToString(vin.Txid)
+					spentTXOs[inTxID] = append(spentTXOs[inTxID], vin.OutIndex)
+				}
+			}
+		}
+
+		if len(block.PrevHash) == 0 {
+			break
+		}
+	}
+
+	id := hex.EncodeToString(txid)
+	for _, spentIndex := range spentTXOs[id] {
+		if spentIndex == index {
+			return true
+		}
+	}
+
+	return false
 }

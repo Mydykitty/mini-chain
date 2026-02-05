@@ -27,7 +27,10 @@ func NewBlock(txs []*Transaction, prevHash []byte, timeUnix int64, height int) *
 	}
 
 	pow := NewProofOfWork(block)
-	nonce, hash := pow.Run()
+	nonce, hash, ok := pow.Run()
+	if !ok {
+		return nil // 👈 挖矿中断，不生成区块
+	}
 
 	block.Hash = hash[:]
 	block.Nonce = nonce

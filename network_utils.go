@@ -42,6 +42,7 @@ func sendData(addr string, data []byte) {
 	}
 	defer conn.Close()
 	conn.Write(data)
+	fmt.Printf("sendData success, addr:%s\n", addr)
 }
 
 func SendTx(addr string, tnx *Transaction) {

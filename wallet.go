@@ -5,16 +5,21 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"log"
+	"math/big"
 )
 
 type Wallet struct {
-	PrivateKey ecdsa.PrivateKey
-	PublicKey  []byte
+	PrivateKeyBytes []byte
+	PublicKey       []byte
 }
 
 func NewWallet() *Wallet {
 	priv, pub := newKeyPair()
-	return &Wallet{priv, pub}
+	privBytes := priv.D.Bytes()
+	return &Wallet{
+		PrivateKeyBytes: privBytes,
+		PublicKey:       pub,
+	}
 }
 
 func newKeyPair() (ecdsa.PrivateKey, []byte) {
@@ -25,4 +30,17 @@ func newKeyPair() (ecdsa.PrivateKey, []byte) {
 	}
 	pub := append(priv.PublicKey.X.Bytes(), priv.PublicKey.Y.Bytes()...)
 	return *priv, pub
+}
+
+func (w *Wallet) ToECDSA() *ecdsa.PrivateKey {
+	curve := elliptic.P256()
+	priv := new(ecdsa.PrivateKey)
+	priv.PublicKey.Curve = curve
+	priv.D = new(big.Int).SetBytes(w.PrivateKeyBytes)
+	priv.PublicKey.X, priv.PublicKey.Y = curve.ScalarBaseMult(w.PrivateKeyBytes)
+	return priv
+}
+
+func (w *Wallet) Address() []byte {
+	return HashPubKey(w.PublicKey)
 }

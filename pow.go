@@ -37,7 +37,7 @@ func (pow *ProofOfWork) prepareData(nonce int) []byte {
 }
 
 // 挖矿
-func (pow *ProofOfWork) Run() (int, []byte) {
+func (pow *ProofOfWork) Run() (int, []byte, bool) {
 	var hashInt big.Int
 	var hash [32]byte
 	nonce := 0
@@ -48,7 +48,7 @@ func (pow *ProofOfWork) Run() (int, []byte) {
 		select {
 		case <-miningInterrupt:
 			fmt.Println("🛑 挖矿被中断，发现新区块")
-			return 0, []byte{}
+			return 0, []byte{}, false
 		default:
 		}
 
@@ -64,7 +64,7 @@ func (pow *ProofOfWork) Run() (int, []byte) {
 	}
 
 	fmt.Printf("✅ 挖矿成功: %x\n", hash)
-	return nonce, hash[:]
+	return nonce, hash[:], true
 }
 
 // 校验区块是否合法

@@ -41,10 +41,11 @@ func (tx *Transaction) SetID() {
 }
 
 // 创建UTXO输出
-func NewTXOutput(value int, address string) *TXOutput {
-	txo := &TXOutput{value, nil}
-	txo.Lock([]byte(address))
-	return txo
+func NewTXOutput(value int, pubKeyHash []byte) *TXOutput {
+	return &TXOutput{
+		Value:      value,
+		PubKeyHash: pubKeyHash,
+	}
 }
 
 // 输出锁定到某个地址
@@ -58,13 +59,19 @@ func (out *TXOutput) IsLockedWithKey(pubKeyHash []byte) bool {
 }
 
 // Coinbase交易
-func NewCoinbaseTX(to, data string) *Transaction {
+func NewCoinbaseTX(toPubKeyHash []byte, data string) *Transaction {
 	if data == "" {
 		data = "Block reward"
 	}
+
 	txin := TXInput{[]byte{}, -1, nil, []byte(data)}
-	txout := NewTXOutput(100, to)
-	tx := Transaction{nil, []TXInput{txin}, []TXOutput{*txout}}
+	txout := NewTXOutput(100, toPubKeyHash)
+
+	tx := Transaction{
+		ID:   nil,
+		Vin:  []TXInput{txin},
+		Vout: []TXOutput{*txout},
+	}
 	tx.SetID()
 	return &tx
 }

@@ -25,7 +25,7 @@ func (tx *Transaction) TrimmedCopy() Transaction {
 }
 
 // 对交易签名
-func (tx *Transaction) Sign(privKey ecdsa.PrivateKey, prevTXs map[string]Transaction) {
+func (tx *Transaction) Sign(privKey *ecdsa.PrivateKey, prevTXs map[string]Transaction) {
 	if tx.IsCoinbase() {
 		return
 	}
@@ -35,7 +35,7 @@ func (tx *Transaction) Sign(privKey ecdsa.PrivateKey, prevTXs map[string]Transac
 		prevTx := prevTXs[hex.EncodeToString(vin.Txid)]
 		txCopy.Vin[inIdx].PubKey = prevTx.Vout[vin.OutIndex].PubKeyHash
 		hash := txCopy.Hash()
-		r, s, err := ecdsa.Sign(rand.Reader, &privKey, hash)
+		r, s, err := ecdsa.Sign(rand.Reader, privKey, hash)
 		if err != nil {
 			log.Panic(err)
 		}

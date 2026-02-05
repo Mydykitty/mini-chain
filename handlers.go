@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"encoding/gob"
-	"encoding/hex"
 	"fmt"
 	"log"
 )
@@ -82,12 +81,21 @@ func handleBlock(request []byte, bc *Blockchain) {
 	block := DeserializeBlock(payload.Block)
 	fmt.Println("⛓️ 收到新区块:", block.Hash)
 
+	if err := ValidateBlock(block, bc); err != nil {
+		fmt.Println("❌ 区块非法，拒绝:", err)
+		return
+	}
+
 	bc.AddBlockFromNetwork(block)
+
+	mempool.RemoveInvalid(bc)
 
 	fmt.Printf("当前区块高度: %d\n", getBestHeight(bc))
 }
 
 func handleTx(request []byte, bc *Blockchain) {
+	fmt.Println("📥 开始handleTx")
+
 	var payload tx
 
 	buff := bytes.NewBuffer(request[12:])
@@ -100,7 +108,7 @@ func handleTx(request []byte, bc *Blockchain) {
 	txData := payload.Transaction
 	transaction := DeserializeTransaction(txData)
 
-	mempool[hex.EncodeToString(transaction.ID)] = transaction
+	mempool.AddToMempool(transaction, bc)
 
 	fmt.Println("📥 收到新交易，已加入交易池")
 

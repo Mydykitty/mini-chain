@@ -1,3 +1,24 @@
+===== balance.go =====
+package main
+
+import (
+	"fmt"
+)
+
+func GetBalance(address string, nodeID string) int {
+	bc := NewBlockchain(nodeID)
+	defer bc.DB.Close()
+
+	pubKeyHash := HashPubKey([]byte(address))
+
+	// 查找所有 UTXO，amount 用大数保证查出全部
+	balance, _ := bc.FindSpendableOutputs(pubKeyHash, 1<<31)
+
+	fmt.Printf("💰 %s 余额: %d\n", address, balance)
+	return balance
+}
+
+
 ===== block.go =====
 package main
 
@@ -28,7 +49,10 @@ func NewBlock(txs []*Transaction, prevHash []byte, timeUnix int64, height int) *
 	}
 
 	pow := NewProofOfWork(block)
-	nonce, hash := pow.Run()
+	nonce, hash, ok := pow.Run()
+	if !ok {
+		return nil // 👈 挖矿中断，不生成区块
+	}
 
 	block.Hash = hash[:]
 	block.Nonce = nonce
@@ -64,6 +88,53 @@ func DeserializeBlock(d []byte) *Block {
 }
 
 
+===== block_validate.go =====
+package main
+
+import "errors"
+
+func ValidateBlock(block *Block, bc *Blockchain) error {
+	// 1️⃣ 必须有交易
+	if len(block.Transactions) == 0 {
+		return errors.New("区块没有交易")
+	}
+
+	// 2️⃣ 第 0 笔必须是 coinbase
+	if !block.Transactions[0].IsCoinbase() {
+		return errors.New("coinbase 必须是第一笔交易")
+	}
+
+	// 3️⃣ 只能有 1 笔 coinbase
+	coinbaseCount := 0
+	for _, tx := range block.Transactions {
+		if tx.IsCoinbase() {
+			coinbaseCount++
+		}
+	}
+	if coinbaseCount != 1 {
+		return errors.New("区块 coinbase 数量不正确")
+	}
+
+	// 4️⃣ 校验 PoW
+	pow := NewProofOfWork(block)
+	if !pow.Validate() {
+		return errors.New("PoW 校验失败")
+	}
+
+	// 5️⃣ 校验普通交易
+	for i, tx := range block.Transactions {
+		if i == 0 {
+			continue
+		}
+		if !bc.VerifyTransaction(tx) {
+			return errors.New("区块包含非法交易")
+		}
+	}
+
+	return nil
+}
+
+
 ===== blockchain.go =====
 package main
 
@@ -86,7 +157,7 @@ type Blockchain struct {
 	DB  *bolt.DB
 }
 
-func CreateBlockchain(address, nodeID string) *Blockchain {
+func CreateBlockchain(toPubKeyHash []byte, nodeID string) *Blockchain {
 	dbFileStr := fmt.Sprintf(dbFile, nodeID)
 
 	db, err := bolt.Open(dbFileStr, 0600, nil)
@@ -100,11 +171,12 @@ func CreateBlockchain(address, nodeID string) *Blockchain {
 		b := tx.Bucket([]byte(blocksBucket))
 
 		if b == nil {
-			genesis := NewGenesisBlock(NewCoinbaseTX(address, "Genesis Block"))
+			genesis := NewGenesisBlock(NewCoinbaseTX(toPubKeyHash, "Genesis Block"))
 			b, _ = tx.CreateBucket([]byte(blocksBucket))
 			b.Put(genesis.Hash, genesis.Serialize())
 			b.Put([]byte("l"), genesis.Hash)
 			tip = genesis.Hash
+			fmt.Println("CreateBlockchain")
 		} else {
 			tip = b.Get([]byte("l"))
 		}
@@ -142,34 +214,6 @@ func NewBlockchain(nodeID string) *Blockchain {
 
 	bc := Blockchain{tip, db}
 	return &bc
-}
-
-// 添加新区块
-func (bc *Blockchain) AddBlock(transactions []*Transaction) {
-	var lastHash []byte
-	var lastHeight int
-
-	err := bc.DB.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(blocksBucket))
-		lastHash = b.Get([]byte("l"))
-		blockData := b.Get(lastHash)
-		block := DeserializeBlock(blockData)
-		lastHeight = block.Height
-		return nil
-	})
-	if err != nil {
-		log.Panic(err)
-	}
-
-	newBlock := NewBlock(transactions, lastHash, time.Now().Unix(), lastHeight+1)
-
-	err = bc.DB.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(blocksBucket))
-		b.Put(newBlock.Hash, newBlock.Serialize())
-		b.Put([]byte("l"), newBlock.Hash)
-		bc.Tip = newBlock.Hash
-		return nil
-	})
 }
 
 // 区块链迭代器
@@ -363,7 +407,7 @@ func (bc *Blockchain) AddBlockFromNetwork(block *Block) {
 		lastBlock := DeserializeBlock(lastBlockData)
 
 		// 如果新区块更高，更新 tip
-		if block.Timestamp > lastBlock.Timestamp {
+		if block.Height > lastBlock.Height {
 			b.Put([]byte("l"), block.Hash)
 			bc.Tip = block.Hash
 		}
@@ -392,6 +436,10 @@ func (bc *Blockchain) MineBlock(txs []*Transaction) *Block {
 	}
 
 	newBlock := NewBlock(txs, lastHash, time.Now().Unix(), lastHeight+1)
+	if newBlock == nil {
+		fmt.Println("⚠️ 本轮挖矿被中断")
+		return nil
+	}
 
 	err = bc.DB.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(blocksBucket))
@@ -404,23 +452,67 @@ func (bc *Blockchain) MineBlock(txs []*Transaction) *Block {
 	return newBlock
 }
 
+func (bc *Blockchain) VerifyTransaction(tx *Transaction) bool {
+	if tx.IsCoinbase() {
+		return true
+	}
+
+	prevTXs := make(map[string]Transaction)
+
+	for _, vin := range tx.Vin {
+		prevTx, err := bc.FindTransaction(vin.Txid)
+		if err != nil {
+			return false
+		}
+
+		// 关键：这个输出是否还没被花费
+		if bc.IsOutputSpent(vin.Txid, vin.OutIndex) {
+			return false
+		}
+
+		prevTXs[hex.EncodeToString(vin.Txid)] = prevTx
+	}
+
+	return tx.Verify(prevTXs)
+}
+
+func (bc *Blockchain) IsOutputSpent(txid []byte, index int) bool {
+	spentTXOs := make(map[string][]int)
+
+	bci := bc.Iterator()
+
+	for {
+		block := bci.Next()
+
+		for _, tx := range block.Transactions {
+			if !tx.IsCoinbase() {
+				for _, vin := range tx.Vin {
+					inTxID := hex.EncodeToString(vin.Txid)
+					spentTXOs[inTxID] = append(spentTXOs[inTxID], vin.OutIndex)
+				}
+			}
+		}
+
+		if len(block.PrevHash) == 0 {
+			break
+		}
+	}
+
+	id := hex.EncodeToString(txid)
+	for _, spentIndex := range spentTXOs[id] {
+		if spentIndex == index {
+			return true
+		}
+	}
+
+	return false
+}
+
 
 ===== cli_mine.go =====
 package main
 
 import "fmt"
-
-func MineBlock(nodeID string) {
-	bc := NewBlockchain(nodeID)
-	defer bc.DB.Close()
-
-	cbTx := NewCoinbaseTX("miner", "CLI Mine Reward")
-	block := bc.MineBlock([]*Transaction{cbTx})
-
-	fmt.Println("⛏️  挖出新区块成功!")
-	fmt.Printf("高度: %d\n", block.Height)
-	fmt.Printf("Hash: %x\n", block.Hash)
-}
 
 func PrintChain(nodeID string) {
 	bc := NewBlockchain(nodeID)
@@ -440,21 +532,6 @@ func Send(from, to string, amount int, nodeID string) {
 	fmt.Println("✅ 交易已创建并广播")
 }
 
-func MineAndBroadcastBlock(bc *Blockchain, nodeID string) {
-	fmt.Println("⛏️  节点", nodeID, "开始挖矿...")
-
-	cbTx := NewCoinbaseTX("miner", "")
-	newBlock := bc.MineBlock([]*Transaction{cbTx})
-
-	fmt.Println("✅ 挖矿成功，高度:", newBlock.Height)
-
-	for _, node := range knownNodes {
-		if node != "localhost:"+nodeID {
-			SendInv(node, "block", [][]byte{newBlock.Hash})
-		}
-	}
-}
-
 
 ===== handlers.go =====
 package main
@@ -462,7 +539,6 @@ package main
 import (
 	"bytes"
 	"encoding/gob"
-	"encoding/hex"
 	"fmt"
 	"log"
 )
@@ -541,12 +617,21 @@ func handleBlock(request []byte, bc *Blockchain) {
 	block := DeserializeBlock(payload.Block)
 	fmt.Println("⛓️ 收到新区块:", block.Hash)
 
+	if err := ValidateBlock(block, bc); err != nil {
+		fmt.Println("❌ 区块非法，拒绝:", err)
+		return
+	}
+
 	bc.AddBlockFromNetwork(block)
+
+	mempool.RemoveInvalid(bc)
 
 	fmt.Printf("当前区块高度: %d\n", getBestHeight(bc))
 }
 
 func handleTx(request []byte, bc *Blockchain) {
+	fmt.Println("📥 开始handleTx")
+
 	var payload tx
 
 	buff := bytes.NewBuffer(request[12:])
@@ -559,7 +644,7 @@ func handleTx(request []byte, bc *Blockchain) {
 	txData := payload.Transaction
 	transaction := DeserializeTransaction(txData)
 
-	mempool[hex.EncodeToString(transaction.ID)] = transaction
+	mempool.AddToMempool(transaction, bc)
 
 	fmt.Println("📥 收到新交易，已加入交易池")
 
@@ -577,20 +662,24 @@ package main
 
 import (
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"log"
+	"net/http"
 	"os"
 	"strconv"
 	"time"
 )
 
 func main() {
+
 	nodeID := os.Args[1]
+
+	ws := NewWallets()
+	myWallet := ws.GetWallet("miner") // 或 miner-3000
 
 	if len(os.Args) > 2 {
 		switch os.Args[2] {
-		case "mine":
-			MineBlock(nodeID)
-			return
 		case "getchain":
 			PrintChain(nodeID)
 			return
@@ -600,38 +689,50 @@ func main() {
 			amount, _ := strconv.Atoi(os.Args[5])
 			Send(from, to, amount, nodeID)
 			return
+		case "createwallet":
+			name := os.Args[3]
+			ws.CreateWallet(name)
+			return
+		case "listwallets":
+			ws.ListWallets()
+			return
+		case "balance":
+			name := os.Args[3]
+			GetBalance(name, nodeID)
+			return
 		}
 	}
 
-	address := "miner"
-	bc := CreateBlockchain(address, nodeID)
+	bc := CreateBlockchain(myWallet.Address(), nodeID)
 	go func() {
 		fmt.Println("🟢 自动挖矿线程已启动")
 
 		for {
 			time.Sleep(10 * time.Second)
 
-			if len(mempool) == 0 {
+			if len(mempool.GetTransactions()) == 0 {
 				continue
 			}
 
-			var txs []*Transaction
+			cbTx := NewCoinbaseTX(myWallet.Address(), "")
+			txs := []*Transaction{cbTx}
 
-			for _, tx := range mempool {
-				txs = append(txs, &tx)
+			for _, tx := range mempool.GetTransactions() {
+				txs = append(txs, tx)
 			}
 
-			cbTx := NewCoinbaseTX("miner-"+nodeID, "")
-			txs = append(txs, cbTx)
-
 			newBlock := bc.MineBlock(txs)
+			if newBlock == nil {
+				fmt.Println("⚠️ main本轮挖矿被中断")
+				continue
+			}
 
 			fmt.Println("⛏️ 打包交易挖出新区块，高度:", newBlock.Height)
 
 			// 清空已打包交易
 			for _, tx := range txs {
 				txID := hex.EncodeToString(tx.ID)
-				delete(mempool, txID)
+				mempool.Remove(txID)
 			}
 
 			for _, node := range knownNodes {
@@ -648,8 +749,44 @@ func main() {
 			MineAndBroadcastBlock(bc, nodeID)
 		}
 	}()*/
+	StartTxServer(bc, nodeID)
 	StartServer(nodeID, bc)
 
+}
+
+func StartTxServer(bc *Blockchain, port string) {
+	http.HandleFunc("/tx", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req struct {
+			From   string `json:"from"`
+			To     string `json:"to"`
+			Amount int    `json:"amount"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid body", http.StatusBadRequest)
+			return
+		}
+
+		tx := NewUTXOTransaction(req.From, req.To, req.Amount, bc)
+		txID := hex.EncodeToString(tx.ID)
+
+		SendTx("localhost:"+port, tx)
+
+		fmt.Println("✅ 交易已创建并广播啊")
+
+		fmt.Fprintf(w, "Transaction added: %s\n", txID)
+	})
+
+	go func() {
+		fmt.Println("🌐 HTTP Server started at port", port)
+		if err := http.ListenAndServe(":"+"4"+port, nil); err != nil { // 43000、43001 等端口
+			log.Panic(err)
+		}
+	}()
 }
 
 /*
@@ -692,6 +829,63 @@ func main() {
 	bc.PrintBlockchain()
 }
 */
+
+
+===== mempool.go =====
+package main
+
+import (
+	"encoding/hex"
+	"fmt"
+	"sync"
+)
+
+type Mempool struct {
+	mu  sync.RWMutex
+	txs map[string]Transaction
+}
+
+var mempool = Mempool{
+	txs: make(map[string]Transaction),
+}
+
+func (mp *Mempool) Remove(txID string) {
+	mp.mu.Lock()
+	defer mp.mu.Unlock()
+	delete(mp.txs, txID)
+}
+
+func (mp *Mempool) GetTransactions() []*Transaction {
+	mp.mu.RLock()
+	defer mp.mu.RUnlock()
+
+	var txs []*Transaction
+	for _, tx := range mp.txs {
+		txCopy := tx
+		txs = append(txs, &txCopy)
+	}
+	return txs
+}
+
+func (mp *Mempool) RemoveInvalid(bc *Blockchain) {
+	mp.mu.Lock()
+	defer mp.mu.Unlock()
+
+	for id, tx := range mp.txs {
+		if !bc.VerifyTransaction(&tx) {
+			fmt.Println("🗑 移除失效交易:", id)
+			delete(mp.txs, id)
+		}
+	}
+}
+
+func (mp *Mempool) AddToMempool(tx Transaction, bc *Blockchain) {
+	if bc.VerifyTransaction(&tx) {
+		mp.txs[hex.EncodeToString(tx.ID)] = tx
+	} else {
+		fmt.Println("❌ 非法交易，拒绝加入mempool")
+	}
+}
 
 
 ===== message.go =====
@@ -771,6 +965,7 @@ func sendData(addr string, data []byte) {
 	}
 	defer conn.Close()
 	conn.Write(data)
+	fmt.Printf("sendData success, addr:%s\n", addr)
 }
 
 func SendTx(addr string, tnx *Transaction) {
@@ -822,7 +1017,7 @@ func (pow *ProofOfWork) prepareData(nonce int) []byte {
 }
 
 // 挖矿
-func (pow *ProofOfWork) Run() (int, []byte) {
+func (pow *ProofOfWork) Run() (int, []byte, bool) {
 	var hashInt big.Int
 	var hash [32]byte
 	nonce := 0
@@ -833,7 +1028,7 @@ func (pow *ProofOfWork) Run() (int, []byte) {
 		select {
 		case <-miningInterrupt:
 			fmt.Println("🛑 挖矿被中断，发现新区块")
-			return 0, []byte{}
+			return 0, []byte{}, false
 		default:
 		}
 
@@ -849,7 +1044,7 @@ func (pow *ProofOfWork) Run() (int, []byte) {
 	}
 
 	fmt.Printf("✅ 挖矿成功: %x\n", hash)
-	return nonce, hash[:]
+	return nonce, hash[:], true
 }
 
 // 校验区块是否合法
@@ -878,7 +1073,6 @@ const nodeVersion = 1
 var nodeAddress string
 var knownNodes = []string{"localhost:3000"} // 种子节点
 var blocksInTransit = [][]byte{}
-var mempool = make(map[string]Transaction)
 var miningInterrupt = make(chan bool)
 
 func StartServer(nodeID string, bc *Blockchain) {
@@ -975,10 +1169,11 @@ func (tx *Transaction) SetID() {
 }
 
 // 创建UTXO输出
-func NewTXOutput(value int, address string) *TXOutput {
-	txo := &TXOutput{value, nil}
-	txo.Lock([]byte(address))
-	return txo
+func NewTXOutput(value int, pubKeyHash []byte) *TXOutput {
+	return &TXOutput{
+		Value:      value,
+		PubKeyHash: pubKeyHash,
+	}
 }
 
 // 输出锁定到某个地址
@@ -992,13 +1187,19 @@ func (out *TXOutput) IsLockedWithKey(pubKeyHash []byte) bool {
 }
 
 // Coinbase交易
-func NewCoinbaseTX(to, data string) *Transaction {
+func NewCoinbaseTX(toPubKeyHash []byte, data string) *Transaction {
 	if data == "" {
 		data = "Block reward"
 	}
+
 	txin := TXInput{[]byte{}, -1, nil, []byte(data)}
-	txout := NewTXOutput(100, to)
-	tx := Transaction{nil, []TXInput{txin}, []TXOutput{*txout}}
+	txout := NewTXOutput(100, toPubKeyHash)
+
+	tx := Transaction{
+		ID:   nil,
+		Vin:  []TXInput{txin},
+		Vout: []TXOutput{*txout},
+	}
 	tx.SetID()
 	return &tx
 }
@@ -1038,48 +1239,51 @@ import (
 
 // 创建一笔UTXO转账交易
 func NewUTXOTransaction(from, to string, amount int, bc *Blockchain) *Transaction {
-	var inputs []TXInput
-	var outputs []TXOutput
+	ws := NewWallets()
+	fromWallet := ws.GetWallet(from)
+	toWallet := ws.GetWallet(to)
 
-	// 获取钱包
-	wallet := NewWallet() // 注意：在完整项目中你应该用钱包管理器获取已有钱包
-	pubKeyHash := HashPubKey([]byte(from))
+	if fromWallet == nil || toWallet == nil {
+		log.Panic("钱包不存在")
+	}
 
-	// 查找可用 UTXO
-	acc, validOutputs := bc.FindSpendableOutputs(pubKeyHash, amount)
+	fromPubKeyHash := fromWallet.Address()
+
+	acc, validOutputs := bc.FindSpendableOutputs(fromPubKeyHash, amount)
 	if acc < amount {
 		log.Panic("余额不足")
 	}
 
-	// 构建输入
+	var inputs []TXInput
+	var outputs []TXOutput
+
 	for txid, outs := range validOutputs {
 		txID, _ := hex.DecodeString(txid)
 		for _, outIdx := range outs {
-			input := TXInput{txID, outIdx, nil, []byte(from)}
-			inputs = append(inputs, input)
+			inputs = append(inputs, TXInput{
+				Txid:     txID,
+				OutIndex: outIdx,
+				PubKey:   fromWallet.PublicKey,
+			})
 		}
 	}
 
-	// 构建输出
-	outputs = append(outputs, *NewTXOutput(amount, to))
+	outputs = append(outputs, *NewTXOutput(amount, toWallet.Address()))
+
 	if acc > amount {
-		// 找零给自己
-		outputs = append(outputs, *NewTXOutput(acc-amount, from))
+		outputs = append(outputs, *NewTXOutput(acc-amount, fromWallet.Address()))
 	}
 
-	// 创建交易
 	tx := Transaction{nil, inputs, outputs}
 	tx.SetID()
 
-	// 签名交易
 	prevTXs := make(map[string]Transaction)
 	for txid := range validOutputs {
-		txInBytes, _ := hex.DecodeString(txid)
-		prevTx, _ := bc.FindTransaction(txInBytes)
-		prevTXs[txid] = prevTx
+		id, _ := hex.DecodeString(txid)
+		prevTXs[txid], _ = bc.FindTransaction(id)
 	}
-	tx.Sign(wallet.PrivateKey, prevTXs)
 
+	tx.Sign(fromWallet.ToECDSA(), prevTXs)
 	return &tx
 }
 
@@ -1112,7 +1316,7 @@ func (tx *Transaction) TrimmedCopy() Transaction {
 }
 
 // 对交易签名
-func (tx *Transaction) Sign(privKey ecdsa.PrivateKey, prevTXs map[string]Transaction) {
+func (tx *Transaction) Sign(privKey *ecdsa.PrivateKey, prevTXs map[string]Transaction) {
 	if tx.IsCoinbase() {
 		return
 	}
@@ -1122,7 +1326,7 @@ func (tx *Transaction) Sign(privKey ecdsa.PrivateKey, prevTXs map[string]Transac
 		prevTx := prevTXs[hex.EncodeToString(vin.Txid)]
 		txCopy.Vin[inIdx].PubKey = prevTx.Vout[vin.OutIndex].PubKeyHash
 		hash := txCopy.Hash()
-		r, s, err := ecdsa.Sign(rand.Reader, &privKey, hash)
+		r, s, err := ecdsa.Sign(rand.Reader, privKey, hash)
 		if err != nil {
 			log.Panic(err)
 		}
@@ -1237,16 +1441,21 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"log"
+	"math/big"
 )
 
 type Wallet struct {
-	PrivateKey ecdsa.PrivateKey
-	PublicKey  []byte
+	PrivateKeyBytes []byte
+	PublicKey       []byte
 }
 
 func NewWallet() *Wallet {
 	priv, pub := newKeyPair()
-	return &Wallet{priv, pub}
+	privBytes := priv.D.Bytes()
+	return &Wallet{
+		PrivateKeyBytes: privBytes,
+		PublicKey:       pub,
+	}
 }
 
 func newKeyPair() (ecdsa.PrivateKey, []byte) {
@@ -1257,6 +1466,86 @@ func newKeyPair() (ecdsa.PrivateKey, []byte) {
 	}
 	pub := append(priv.PublicKey.X.Bytes(), priv.PublicKey.Y.Bytes()...)
 	return *priv, pub
+}
+
+func (w *Wallet) ToECDSA() *ecdsa.PrivateKey {
+	curve := elliptic.P256()
+	priv := new(ecdsa.PrivateKey)
+	priv.PublicKey.Curve = curve
+	priv.D = new(big.Int).SetBytes(w.PrivateKeyBytes)
+	priv.PublicKey.X, priv.PublicKey.Y = curve.ScalarBaseMult(w.PrivateKeyBytes)
+	return priv
+}
+
+func (w *Wallet) Address() []byte {
+	return HashPubKey(w.PublicKey)
+}
+
+
+===== wallets.go =====
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"io/ioutil"
+	"log"
+	"os"
+)
+
+type Wallets struct {
+	Wallets map[string]*Wallet // key: 地址，value: 钱包对象
+}
+
+const walletFile = "wallets.json"
+
+// 创建钱包管理器
+func NewWallets() *Wallets {
+	wallets := &Wallets{Wallets: make(map[string]*Wallet)}
+
+	if _, err := os.Stat(walletFile); err == nil {
+		data, err := ioutil.ReadFile(walletFile)
+		if err != nil {
+			log.Panic(err)
+		}
+		err = json.Unmarshal(data, wallets)
+		if err != nil {
+			log.Panic(err)
+		}
+	}
+
+	return wallets
+}
+
+// 保存钱包到文件
+func (ws *Wallets) Save() {
+	data, err := json.Marshal(ws)
+	if err != nil {
+		log.Panic(err)
+	}
+	ioutil.WriteFile(walletFile, data, 0644)
+}
+
+// 创建一个新钱包
+func (ws *Wallets) CreateWallet(name string) string {
+	wallet := NewWallet()
+	ws.Wallets[name] = wallet
+	ws.Save()
+	fmt.Println("✅ 钱包创建成功，名称:", name)
+	return name
+}
+
+// 获取钱包
+func (ws *Wallets) GetWallet(name string) *Wallet {
+	return ws.Wallets[name]
+}
+
+// 列出所有钱包
+func (ws *Wallets) ListWallets() {
+	fmt.Println("==== 钱包列表 ====")
+	for name := range ws.Wallets {
+		fmt.Println(name)
+	}
 }
 
 
